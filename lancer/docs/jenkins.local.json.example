@@ -1,0 +1,10 @@
+{
+  "baseUrl": "http://jenkins.example.com:8080/jenkins",
+  "username": "your-username",
+  "apiToken": "REPLACE_WITH_YOUR_API_TOKEN",
+  "webhook": {
+    "enabled": true,
+    "port": 18765,
+    "token": "optional-shared-secret"
+  }
+}

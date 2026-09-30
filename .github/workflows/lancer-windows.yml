@@ -1,0 +1,49 @@
+# 在 GitHub 上手动触发，用 Windows 机器打 Lancer NSIS 安装包。
+# 本仓库远程若仍是 Gitee，需要另加 GitHub remote 并 push 后才会跑。
+name: Lancer Windows
+
+on:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: lancer
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.25.0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: lancer/pnpm-lock.yaml
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: lancer/src-tauri -> target
+
+      - name: Install frontend deps
+        run: pnpm install --frozen-lockfile
+
+      - name: Build Windows NSIS
+        run: pnpm tauri build --bundles nsis
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: lancer-windows-nsis
+          path: lancer/src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: error

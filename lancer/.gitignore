@@ -1,0 +1,16 @@
+# Lancer ignore
+node_modules/
+dist/
+src-tauri/target/
+.cargo-home/
+.DS_Store
+*.log
+.env
+.env.*
+!.env.example
+jenkins.local.json
+**/jenkins.local.json
+# routeTree.gen.ts 由 Vite 插件生成；纳入版本库，保证 CI 里 tsc 能过
+coverage/
+.turbo/
+*.tsbuildinfo

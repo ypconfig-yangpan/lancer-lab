@@ -1,0 +1,14 @@
+services:
+  drone:
+    image: docker.m.daocloud.io/drone/drone:2
+    container_name: drone
+    restart: unless-stopped
+    ports:
+      - "0.0.0.0:80:80"
+    volumes:
+      - /var/lib/drone:/data
+    env_file:
+      - .env
+    environment:
+      DRONE_GITEE_SERVER: https://gitee.com
+      DRONE_GITEE_API_SERVER: https://gitee.com/api/v5

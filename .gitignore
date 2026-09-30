@@ -1,0 +1,15 @@
+.DS_Store
+*.log
+**/.env
+**/.env.*
+!**/.env.example
+**/*.local.md
+**/secrets.local.md
+**/credentials.local*
+**/credentials.secrets*
+apps/*/target/
+.idea/
+.cursor/
+.pnpm-store/
+notes/
+servers/

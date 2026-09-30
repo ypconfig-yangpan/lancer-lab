@@ -1,0 +1,20 @@
+[Unit]
+Description=serviceA
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=servicea
+Group=servicea
+WorkingDirectory=/opt/apps/serviceA
+Environment=JAVA_OPTS=-Xms64m -Xmx256m
+ExecStart=/usr/bin/java $JAVA_OPTS -jar /opt/apps/serviceA/app.jar
+SuccessExitStatus=143
+Restart=on-failure
+RestartSec=5s
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

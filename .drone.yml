@@ -1,0 +1,86 @@
+kind: pipeline
+type: docker
+name: build
+
+# Mac OrbStack Runner 是 arm64；不写的话默认 amd64，会一直 pending
+platform:
+  os: linux
+  arch: arm64
+
+# push：只打包。网页 New Build 也是 custom，一并允许
+trigger:
+  branch:
+    - develop
+  event:
+    - push
+    - custom
+
+steps:
+  - name: build
+    image: docker.m.daocloud.io/library/maven:3.9-eclipse-temurin-21
+    commands:
+      - mvn -B --no-transfer-progress -s ci/maven-settings.xml -f apps/serviceA/pom.xml clean package -DskipTests
+      - test -f apps/serviceA/target/serviceA.jar
+
+---
+kind: pipeline
+type: docker
+name: deploy
+
+platform:
+  os: linux
+  arch: arm64
+
+# 手动发：Drone 打开某次构建 → Promote → 环境填 test
+trigger:
+  event:
+    - promote
+  target:
+    - test
+
+steps:
+  - name: build
+    image: docker.m.daocloud.io/library/maven:3.9-eclipse-temurin-21
+    commands:
+      - mvn -B --no-transfer-progress -s ci/maven-settings.xml -f apps/serviceA/pom.xml clean package -DskipTests
+      - test -f apps/serviceA/target/serviceA.jar
+
+  - name: push_jar
+    image: docker.m.daocloud.io/library/alpine:3.20
+    depends_on:
+      - build
+    environment:
+      deploy_host:
+        from_secret: deploy-host
+      deploy_user:
+        from_secret: deploy-user
+      deploy_ssh_port:
+        from_secret: deploy-ssh-port
+      deploy_ssh_key:
+        from_secret: deploy-ssh-key
+      deploy_known_hosts:
+        from_secret: deploy-known-hosts
+    commands:
+      - sed -i 's#dl-cdn.alpinelinux.org#mirrors.aliyun.com#g' /etc/apk/repositories
+      - apk add --no-cache bash openssh-client
+      - ./scripts/push_jar.sh
+
+  - name: restart_app
+    image: docker.m.daocloud.io/library/alpine:3.20
+    depends_on:
+      - push_jar
+    environment:
+      deploy_host:
+        from_secret: deploy-host
+      deploy_user:
+        from_secret: deploy-user
+      deploy_ssh_port:
+        from_secret: deploy-ssh-port
+      deploy_ssh_key:
+        from_secret: deploy-ssh-key
+      deploy_known_hosts:
+        from_secret: deploy-known-hosts
+    commands:
+      - sed -i 's#dl-cdn.alpinelinux.org#mirrors.aliyun.com#g' /etc/apk/repositories
+      - apk add --no-cache bash openssh-client
+      - ./scripts/restart_app.sh
