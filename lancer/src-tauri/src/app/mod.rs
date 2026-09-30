@@ -33,6 +33,7 @@ pub fn run() {
             crate::commands::health::app_health,
             crate::commands::health::ack_abnormal_exit,
             crate::commands::health::app_prepare_shutdown,
+            crate::commands::health::app_request_exit,
             crate::commands::health::list_diagnostic_log_files,
             crate::commands::frontend_log::report_frontend_log,
             crate::commands::cluster::list_kube_contexts,
@@ -103,14 +104,26 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building Lancer");
 
-    app.run(|app_handle, event| {
-        if let RunEvent::Exit = event {
-            // Safety net if the frontend never reached prepareShutdown.
+    app.run(|app_handle, event| match event {
+        // macOS：Dock 再点图标时把隐藏的主窗口唤回
+        RunEvent::Reopen {
+            has_visible_windows, ..
+        } => {
+            if !has_visible_windows {
+                if let Some(window) = app_handle.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.unminimize();
+                    let _ = window.set_focus();
+                }
+            }
+        }
+        RunEvent::Exit => {
             let services = app_handle.state::<AppServices>();
             tauri::async_runtime::block_on(async {
                 services.prepare_shutdown().await;
             });
             tracing::info!(target: "lancer::app", "application exited");
         }
+        _ => {}
     });
 }

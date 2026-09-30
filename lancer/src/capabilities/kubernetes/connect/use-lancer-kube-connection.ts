@@ -11,6 +11,7 @@ import { formatAppError } from "@/shared/lib/app-error";
 
 /**
  * Auto-connect Dashboard using pasted kubeconfig under ~/.lancer/kubeconfigs/.
+ * 连接失败只记一次错误，不再循环重试（打包版否则会疯狂打 API）。
  */
 export function useEnsureLancerKubeConnection() {
   const statusQuery = useKubeCredentialStatus(true);
@@ -21,14 +22,20 @@ export function useEnsureLancerKubeConnection() {
   const setNamespace = useKubernetesWorkspaceStore((s) => s.setNamespace);
   const kubeAutoConnect = useConnectionSessionStore((s) => s.kubeAutoConnect);
   const inFlight = useRef(false);
+  const attempted = useRef(false);
   const [busy, setBusy] = useState(false);
   const [localError, setLocalError] = useState<string | null>(null);
 
-  // 进入 K8s 页强制刷新凭证状态，避免凭证页缓存与这边脱节
   useEffect(() => {
     void statusQuery.refetch();
     // eslint-disable-next-line react-hooks/exhaustive-deps -- 仅挂载时拉一次
   }, []);
+
+  useEffect(() => {
+    if (!kubeAutoConnect) {
+      attempted.current = false;
+    }
+  }, [kubeAutoConnect]);
 
   const preferred = statusQuery.data?.preferredContext ?? null;
   const absolutePath = statusQuery.data?.absolutePath ?? null;
@@ -50,7 +57,6 @@ export function useEnsureLancerKubeConnection() {
       return;
     }
 
-    // 已连上同一 context
     if (activeCluster?.context === preferred) {
       if (defaultNs) setNamespace(defaultNs);
       setLocalError(null);
@@ -65,12 +71,16 @@ export function useEnsureLancerKubeConnection() {
       return;
     }
 
-    // 用户在凭证页点过「断开」：保持断开，直到再点「连接」
     if (!kubeAutoConnect) {
       setLocalError("已断开连接。请到「凭证」点「连接」");
       return;
     }
 
+    if (attempted.current) {
+      return;
+    }
+
+    attempted.current = true;
     inFlight.current = true;
     setBusy(true);
     setLocalError(null);
@@ -130,6 +140,7 @@ export function useEnsureLancerKubeConnection() {
     configured,
     paused: !kubeAutoConnect && !activeCluster,
     refetchConnected: () => {
+      attempted.current = false;
       void statusQuery.refetch();
       void connectedQuery.refetch();
     },

@@ -54,9 +54,9 @@ export function AppShell() {
     });
   }, [shell, clearTabsForModule]);
 
-  // Auto-open Kubernetes on first paint when nothing selected.
+  // 首次进入或关掉所有页签后，自动回到 Kubernetes，避免只剩空白「地板」
   useEffect(() => {
-    if (activeActivityId !== null) {
+    if (openTabs.length > 0 && activeTabId !== null) {
       return;
     }
     const k8s = shell.platform.activities.list().find((a) => a.moduleId === "kubernetes");
@@ -78,7 +78,7 @@ export function AppShell() {
         "pinned",
       );
     }
-  }, [activeActivityId, shell, setActiveActivityId, openWorkspaceTab]);
+  }, [activeTabId, openTabs.length, shell, setActiveActivityId, openWorkspaceTab]);
 
   return (
     <PanelErrorBoundary name="workspace" fallback={crashFallback}>

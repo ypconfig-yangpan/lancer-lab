@@ -11,7 +11,7 @@ import {
   Settings2,
 } from "lucide-react";
 import type { ComponentType } from "react";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useShellFacade } from "@/app/facades/shell-facade-provider";
 import { useDockerUiStore } from "@/capabilities/docker/mock/docker-ui-store";
@@ -255,9 +255,43 @@ export function AppSidebar() {
 function SettingsGear() {
   const { t } = useTranslation();
   const [open, setOpen] = useState(false);
+  const [logDir, setLogDir] = useState<string | null>(null);
   const theme = useWorkspaceStore((s) => s.theme);
   const setTheme = useWorkspaceStore((s) => s.setTheme);
   const modules = useShellFacade().listModules();
+
+  useEffect(() => {
+    if (!open) return;
+    void (async () => {
+      try {
+        const { invokeCommand } = await import("@/shared/tauri");
+        const health = await invokeCommand<{ logDir?: string }>("app_health");
+        setLogDir(health.logDir ?? null);
+      } catch {
+        setLogDir(null);
+      }
+    })();
+  }, [open]);
+
+  const openLogDir = async () => {
+    if (!logDir) return;
+    try {
+      const { openPath } = await import("@tauri-apps/plugin-opener");
+      await openPath(logDir);
+    } catch {
+      // ignore — opener may be unavailable in some hosts
+    }
+  };
+
+  const quitApp = async () => {
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      await invoke("app_prepare_shutdown");
+      await invoke("app_request_exit");
+    } catch {
+      // ignore
+    }
+  };
 
   return (
     <div className="relative">
@@ -288,13 +322,28 @@ function SettingsGear() {
             ))}
           </div>
           <div className="mb-1 text-[12px] font-semibold">{t("settings.modules.title")}</div>
-          <ul className="space-y-0.5 text-[11px] text-muted-foreground">
+          <ul className="mb-2 space-y-0.5 text-[11px] text-muted-foreground">
             {modules.map((m) => (
               <li key={m.id} className="truncate px-1">
                 {m.name}
               </li>
             ))}
           </ul>
+          <button
+            type="button"
+            className="w-full rounded-[6px] px-2 py-1.5 text-left text-[12px] text-slate-700 hover:bg-surface-hover disabled:opacity-40"
+            disabled={!logDir}
+            onClick={() => void openLogDir()}
+          >
+            打开应用日志目录
+          </button>
+          <button
+            type="button"
+            className="mt-1 w-full rounded-[6px] px-2 py-1.5 text-left text-[12px] text-destructive hover:bg-surface-hover"
+            onClick={() => void quitApp()}
+          >
+            退出 Lancer
+          </button>
         </div>
       ) : null}
     </div>

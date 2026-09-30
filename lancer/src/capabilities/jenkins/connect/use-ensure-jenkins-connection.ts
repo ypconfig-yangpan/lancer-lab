@@ -8,17 +8,26 @@ import { formatAppError } from "@/shared/lib/app-error";
 
 /**
  * Auto-connect Jenkins from ~/.lancer/jenkins.json on mount.
+ * 只尝试一次，失败后停住，避免打包后疯狂重连。
  */
 export function useEnsureJenkinsConnection() {
   const statusQuery = useJenkinsStatus();
   const connect = useConnectJenkins();
   const jenkinsAutoConnect = useConnectionSessionStore((s) => s.jenkinsAutoConnect);
   const inFlight = useRef(false);
+  const attempted = useRef(false);
   const [localError, setLocalError] = useState<string | null>(null);
   const connected = statusQuery.data?.connected === true;
   const statusLoading = statusQuery.isLoading;
   const connectPending = connect.isPending;
   const mutateAsync = connect.mutateAsync;
+
+  // 用户主动断开后，允许下次打开自动连再试一次
+  useEffect(() => {
+    if (!jenkinsAutoConnect) {
+      attempted.current = false;
+    }
+  }, [jenkinsAutoConnect]);
 
   useEffect(() => {
     if (inFlight.current || statusLoading || connectPending || connected) {
@@ -28,7 +37,11 @@ export function useEnsureJenkinsConnection() {
       setLocalError("已断开连接。请到「凭证」点「连接」");
       return;
     }
+    if (attempted.current) {
+      return;
+    }
 
+    attempted.current = true;
     inFlight.current = true;
     setLocalError(null);
     void (async () => {
@@ -50,6 +63,9 @@ export function useEnsureJenkinsConnection() {
     status: statusQuery.data,
     error: localError,
     paused: !jenkinsAutoConnect && !connected,
-    refreshStatus: () => statusQuery.refetch(),
+    refreshStatus: () => {
+      attempted.current = false;
+      void statusQuery.refetch();
+    },
   };
 }

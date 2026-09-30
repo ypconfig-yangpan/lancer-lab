@@ -41,3 +41,9 @@ pub async fn app_prepare_shutdown(services: State<'_, AppServices>) -> Result<()
     services.prepare_shutdown().await;
     Ok(())
 }
+
+/// Quit the whole process after graceful frontend shutdown (macOS destroy-only can leave a blank window).
+#[tauri::command]
+pub fn app_request_exit(app: tauri::AppHandle) {
+    app.exit(0);
+}
