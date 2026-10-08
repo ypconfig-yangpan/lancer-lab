@@ -58,6 +58,7 @@ pub async fn open_managed_log_session(
                 namespace: input.namespace,
                 pod: input.pod,
                 container: input.container,
+                container_id: None,
                 follow: input.follow.unwrap_or(true),
                 seed_lines: input.seed_lines,
                 previous: input.previous.unwrap_or(false),

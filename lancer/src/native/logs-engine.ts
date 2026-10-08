@@ -66,7 +66,7 @@ export function createInMemoryLogsNativeApi(options?: {
         truncated: false,
       };
       sessions.set(sessionId, { info, lines });
-      return { sessionId };
+      return { sessionId, fromCache: false };
     },
 
     async close(sessionId: string): Promise<void> {

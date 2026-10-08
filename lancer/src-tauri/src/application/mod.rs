@@ -22,9 +22,11 @@ use crate::infrastructure::jenkins::{
     JenkinsJobSummaryDto, JenkinsQueueItemDto, JenkinsStatusDto, JenkinsWebhookListenManager,
 };
 use crate::infrastructure::managed_logs::{
-    start_kube_follow, FindLineAtTimeDto, LogSessionInfoDto, LogWindowDto, ManagedLogStore,
-    OpenManagedLogInput, SearchResultDto,
+    start_kube_follow, FindLineAtTimeDto, LogSessionInfoDto, LogSessionKey, LogWindowDto,
+    ManagedLogStore, OpenManagedLogInput, SearchResultDto,
 };
+use k8s_openapi::api::core::v1::Pod;
+use kube::api::Api;
 
 /// Shared application services injected into Tauri state.
 #[derive(Clone)]
@@ -347,6 +349,45 @@ impl AppServices {
         let since_seconds = input.since_seconds;
         let tail_lines = input.tail_lines;
 
+        let container_id = resolve_container_id(
+            client.clone(),
+            &namespace,
+            &pod,
+            &container,
+            previous,
+        )
+        .await;
+        let mut input = input;
+        input.container_id = Some(container_id.clone());
+
+        if let Some(key) = LogSessionKey::from_open_input(&input) {
+            if let Some(hit) = self.managed_logs.try_reattach(&key).await {
+                if hit.needs_stream {
+                    let abort = start_kube_follow(
+                        app,
+                        &self.managed_logs,
+                        hit.info.session_id.clone(),
+                        hit.path,
+                        client,
+                        namespace,
+                        pod,
+                        container,
+                        follow,
+                        previous,
+                        None,
+                        None,
+                        hit.resume_since,
+                        hit.line_counter,
+                        hit.paused,
+                    );
+                    self.managed_logs
+                        .attach_follow_abort(&hit.info.session_id, abort)
+                        .await?;
+                }
+                return Ok(hit.info);
+            }
+        }
+
         let (info, path, line_counter, paused) =
             self.managed_logs.open_for_stream(input).await?;
 
@@ -363,6 +404,7 @@ impl AppServices {
             previous,
             since_seconds,
             tail_lines,
+            None,
             line_counter,
             paused,
         );
@@ -795,6 +837,42 @@ impl AppServices {
 impl Default for AppServices {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Resolve runtime container id for Session fingerprint (CrashLoop invalidates cache).
+async fn resolve_container_id(
+    client: kube::Client,
+    namespace: &str,
+    pod: &str,
+    container: &str,
+    previous: bool,
+) -> String {
+    let api: Api<Pod> = Api::namespaced(client, namespace);
+    let Ok(obj) = api.get(pod).await else {
+        return String::new();
+    };
+    let Some(status) = obj.status else {
+        return String::new();
+    };
+    let statuses = status.container_statuses.unwrap_or_default();
+    let target = statuses.into_iter().find(|c| {
+        if container.is_empty() {
+            true
+        } else {
+            c.name == container
+        }
+    });
+    let Some(cs) = target else {
+        return String::new();
+    };
+    if previous {
+        cs.last_state
+            .and_then(|st| st.terminated)
+            .and_then(|t| t.container_id)
+            .unwrap_or_default()
+    } else {
+        cs.container_id.unwrap_or_default()
     }
 }
 

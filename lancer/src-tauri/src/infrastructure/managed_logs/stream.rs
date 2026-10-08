@@ -28,6 +28,8 @@ pub struct ManagedLogAppendedPayload {
 }
 
 /// Spawn follow task; caller stores AbortHandle on the session.
+///
+/// Catch-up after Suspend: pass `since_time` (RFC3339); then `since_seconds` / `tail_lines` ignored.
 pub fn spawn_kube_follow(
     app: tauri::AppHandle,
     sessions: Arc<Mutex<std::collections::HashMap<String, SessionState>>>,
@@ -41,6 +43,7 @@ pub fn spawn_kube_follow(
     previous: bool,
     since_seconds: Option<i64>,
     tail_lines: Option<i64>,
+    since_time: Option<String>,
     line_counter: Arc<AtomicU64>,
     paused: Arc<AtomicBool>,
 ) -> tokio::task::AbortHandle {
@@ -58,6 +61,7 @@ pub fn spawn_kube_follow(
             previous,
             since_seconds,
             tail_lines,
+            since_time,
             line_counter,
             paused,
         )
@@ -102,25 +106,31 @@ async fn run_follow(
     previous: bool,
     since_seconds: Option<i64>,
     tail_lines: Option<i64>,
+    since_time: Option<String>,
     line_counter: Arc<AtomicU64>,
     paused: Arc<AtomicBool>,
 ) -> Result<(), AppError> {
     let api: Api<Pod> = Api::namespaced(client, &namespace);
-    // since_seconds and tail_lines are mutually exclusive in practice; 0 / None = unlimited history.
-    let effective_tail = if since_seconds.is_some() {
-        None
+    let catch_up = since_time.as_ref().and_then(|s| parse_k8s_time(s));
+    // Catch-up after Suspend uses since_time only; else since_seconds XOR tail_lines.
+    let (effective_since_seconds, effective_tail, effective_since_time) = if catch_up.is_some() {
+        (None, None, catch_up)
+    } else if since_seconds.is_some() {
+        (since_seconds, None, None)
     } else {
-        match tail_lines {
+        let tail = match tail_lines {
             None => Some(5_000),
             Some(0) => None,
             Some(n) => Some(n),
-        }
+        };
+        (None, tail, None)
     };
     let params = LogParams {
         follow,
         timestamps: true,
         previous,
-        since_seconds,
+        since_seconds: effective_since_seconds,
+        since_time: effective_since_time,
         container: if container.is_empty() {
             None
         } else {
@@ -138,7 +148,8 @@ async fn run_follow(
         container = %container,
         follow,
         previous,
-        since_seconds = ?since_seconds,
+        since_seconds = ?effective_since_seconds,
+        since_time = ?since_time,
         tail_lines = ?effective_tail,
         "starting kube log stream"
     );
@@ -247,6 +258,13 @@ async fn flush_batch(
         return Ok(());
     }
     let batch = std::mem::take(pending);
+    let last_ts = batch.last().and_then(|l| {
+        if l.timestamp.is_empty() {
+            None
+        } else {
+            Some(l.timestamp.clone())
+        }
+    });
     let path_write = path.clone();
     let written = tokio::task::spawn_blocking(move || append_jsonl_lines(&path_write, &batch))
         .await
@@ -264,6 +282,9 @@ async fn flush_batch(
         if let Some(session) = guard.get_mut(session_id) {
             // Counter already advanced; sync info from atomic for readers.
             session.info.total_lines = line_counter.load(Ordering::SeqCst);
+            if let Some(ts) = last_ts {
+                session.last_log_timestamp = Some(ts);
+            }
             session.info.total_lines
         } else {
             return Ok(());
@@ -321,6 +342,11 @@ fn split_kube_timestamp(raw: &str) -> (&str, &str) {
     } else {
         ("", raw)
     }
+}
+
+fn parse_k8s_time(raw: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    let dt = chrono::DateTime::parse_from_rfc3339(raw.trim()).ok()?;
+    Some(dt.with_timezone(&chrono::Utc))
 }
 
 fn infer_level(message: &str) -> &'static str {

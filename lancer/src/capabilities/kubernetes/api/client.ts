@@ -104,7 +104,7 @@ export const kubernetesApi = {
     previous?: boolean;
     sinceSeconds?: number;
     tailLines?: number;
-  }): Promise<{ sessionId: string }> {
+  }): Promise<{ sessionId: string; fromCache?: boolean }> {
     return logs.open({
       provider: "kubernetes",
       ...input,

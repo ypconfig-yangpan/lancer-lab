@@ -64,6 +64,8 @@ export interface NativeLogOpenInput {
 
 export interface NativeLogSession {
   sessionId: string;
+  /** Grace Period re-attach hit an existing Detached/Active session. */
+  fromCache?: boolean;
 }
 
 export interface NativeLogWindowInput {

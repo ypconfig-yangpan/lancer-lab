@@ -507,7 +507,9 @@ function KubernetesDashboardPage() {
           <KubernetesLogsPane
             embedded
             allowPodSwitch
-            enableCollapse={false}
+            openWhenExpanded
+            defaultCollapsed
+            enableCollapse
             focusedPodUid={focusedPodUid}
             onFocusedPodUidChange={setFocusedPodUid}
             expandedClassName="h-full"

@@ -18,6 +18,9 @@
 | [log-search-ui.md](./log-search-ui.md) | Search UI 线框细节（从属于 Workbench） |
 | [history-live-resume.md](./history-live-resume.md) | 历史 → 实时：Stream Cursor、Overlap、Dedup |
 | [storage-and-index.md](./storage-and-index.md) | JSONL、稀疏索引、seek、retention（服务 **Read**） |
+| [read-window.md](./read-window.md) | **正式模型**：滑动 Read Window、Follow、Reset View、Scroll Anchor |
+| [viewer-session-architecture.md](./viewer-session-architecture.md) | **权威**：Viewer↔Session、L1/L2/L3、Active/Suspended、交互与状态栏 |
+| [session-keepalive.md](./session-keepalive.md) | Suspend 断流保盘、45s TTL、LRU=2、sinceTime 补流 |
 | [search-and-window-read.md](./search-and-window-read.md) | Search≠Read 契约；时间跳转；导出 |
 | [search-architecture.md](./search-architecture.md) | Search 引擎：ripgrep crates、取消、不阻塞 Follow |
 | [ai-context-collection.md](./ai-context-collection.md) | AI 边界：采集 Text，不建 Log 领域模型 |

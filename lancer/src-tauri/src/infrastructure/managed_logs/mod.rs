@@ -15,7 +15,7 @@ use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use kube::Client;
 use serde::{Deserialize, Serialize};
@@ -45,6 +45,26 @@ const MAX_WINDOW_LIMIT: usize = 10_000;
 /// Retention: keep ~14 days and ≤ 2 GiB under managed-logs/.
 const RETENTION_MAX_AGE_DAYS: u64 = 14;
 const RETENTION_MAX_TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// Suspended TTL: after UI close, keep L2 file briefly (docs/logs/viewer-session-architecture.md).
+const GRACE_TTL: Duration = Duration::from_secs(45);
+/// Max Suspended kube sessions (LRU).
+const MAX_DETACHED: usize = 2;
+
+/// Session fingerprint for cache hit. Param / containerId change ⇒ new session.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct LogSessionKey {
+    pub connection_id: String,
+    pub namespace: String,
+    pub pod: String,
+    pub container: String,
+    /// Runtime container id (CrashLoop ⇒ new fingerprint). Empty if unknown.
+    pub container_id: String,
+    pub previous: bool,
+    /// 0 = no since filter.
+    pub since_seconds: i64,
+    /// Used when since_seconds == 0; 0 = unlimited tail.
+    pub tail_lines: i64,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -69,6 +89,9 @@ pub struct LogSessionInfoDto {
     pub truncated: bool,
     /// Absolute path of the on-disk source (diagnostics / debug).
     pub file_path: String,
+    /// True when Grace Period re-attach hit an existing Detached session.
+    #[serde(default)]
+    pub from_cache: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -88,6 +111,8 @@ pub struct OpenManagedLogInput {
     pub namespace: Option<String>,
     pub pod: Option<String>,
     pub container: Option<String>,
+    /// Runtime container id for fingerprint (CrashLoop invalidates cache).
+    pub container_id: Option<String>,
     pub follow: bool,
     pub seed_lines: Option<usize>,
     /// Previous container instance (kube `previous`).
@@ -98,12 +123,82 @@ pub struct OpenManagedLogInput {
     pub tail_lines: Option<i64>,
 }
 
+impl LogSessionKey {
+    pub fn from_open_input(input: &OpenManagedLogInput) -> Option<Self> {
+        let connection_id = input
+            .connection_id
+            .as_ref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())?;
+        let pod = input
+            .pod
+            .as_ref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())?;
+        let namespace = input
+            .namespace
+            .as_ref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "default".to_string());
+        let container = input
+            .container
+            .as_ref()
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        let since_seconds = input.since_seconds.unwrap_or(0).max(0);
+        let tail_lines = if since_seconds > 0 {
+            0
+        } else {
+            input.tail_lines.unwrap_or(5_000).max(0)
+        };
+        let container_id = input
+            .container_id
+            .as_ref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_default();
+        Some(Self {
+            connection_id,
+            namespace,
+            pod,
+            container,
+            container_id,
+            previous: input.previous,
+            since_seconds,
+            tail_lines,
+        })
+    }
+}
+
+/// Result of Suspended → Active re-attach (may need a new kube stream).
+pub struct ReattachHandle {
+    pub info: LogSessionInfoDto,
+    pub path: PathBuf,
+    pub line_counter: Arc<AtomicU64>,
+    pub paused: Arc<AtomicBool>,
+    /// Last kube timestamp for `sinceTime` catch-up.
+    pub resume_since: Option<String>,
+    /// True when stream was aborted on suspend — caller must start_kube_follow again.
+    pub needs_stream: bool,
+}
+
 pub(crate) struct SessionState {
     pub info: LogSessionInfoDto,
     pub path: PathBuf,
     pub abort: Option<tokio::task::AbortHandle>,
     pub paused: Arc<AtomicBool>,
     pub line_counter: Arc<AtomicU64>,
+    /// Kube stream identity; None = seed-only (no re-attach).
+    pub key: Option<LogSessionKey>,
+    /// Last line timestamp from kube (RFC3339); used for Suspended re-attach catch-up.
+    pub last_log_timestamp: Option<String>,
+    /// Active UI attach count. Suspend only when this reaches 0.
+    pub attach_count: u32,
+    /// None = Active; Some = Suspended since that instant.
+    pub detached_at: Option<Instant>,
+    /// TTL teardown task while Suspended.
+    pub grace_timer: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// Host-owned disk log sessions. Source of truth is the file; UI only reads windows.
@@ -111,6 +206,8 @@ pub(crate) struct SessionState {
 pub struct ManagedLogStore {
     root: Arc<Mutex<Option<PathBuf>>>,
     sessions: Arc<Mutex<HashMap<String, SessionState>>>,
+    /// key → session_id for re-attach lookup.
+    by_key: Arc<Mutex<HashMap<LogSessionKey, String>>>,
     /// Per-session cancel flag for in-flight search (new search cancels previous).
     search_cancels: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
 }
@@ -120,6 +217,7 @@ impl ManagedLogStore {
         Self {
             root: Arc::new(Mutex::new(None)),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            by_key: Arc::new(Mutex::new(HashMap::new())),
             search_cancels: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -188,6 +286,7 @@ impl ManagedLogStore {
             total_lines: written as u64,
             truncated: false,
             file_path: path.display().to_string(),
+            from_cache: false,
         };
 
         self.sessions.lock().await.insert(
@@ -198,6 +297,11 @@ impl ManagedLogStore {
                 abort: None,
                 paused: Arc::new(AtomicBool::new(false)),
                 line_counter: Arc::new(AtomicU64::new(written as u64)),
+                key: None,
+                last_log_timestamp: None,
+                attach_count: 1,
+                detached_at: None,
+                grace_timer: None,
             },
         );
 
@@ -209,6 +313,7 @@ impl ManagedLogStore {
         &self,
         input: OpenManagedLogInput,
     ) -> Result<(LogSessionInfoDto, PathBuf, Arc<AtomicU64>, Arc<AtomicBool>), AppError> {
+        let key = LogSessionKey::from_open_input(&input);
         let (path, meta) = self.prepare_session_file(&input).await?;
         let path_create = path.clone();
         task::spawn_blocking(move || create_empty_log_file(&path_create))
@@ -237,6 +342,7 @@ impl ManagedLogStore {
             total_lines: 0,
             truncated: false,
             file_path: path.display().to_string(),
+            from_cache: false,
         };
 
         self.sessions.lock().await.insert(
@@ -247,10 +353,57 @@ impl ManagedLogStore {
                 abort: None,
                 paused: paused.clone(),
                 line_counter: line_counter.clone(),
+                key: key.clone(),
+                last_log_timestamp: None,
+                attach_count: 1,
+                detached_at: None,
+                grace_timer: None,
             },
         );
+        if let Some(k) = key {
+            self.by_key.lock().await.insert(k, meta.session_id.clone());
+        }
 
         Ok((info, path, line_counter, paused))
+    }
+
+    /// Re-attach Suspended/Active session. Cancels TTL; may require caller to resume stream.
+    pub async fn try_reattach(&self, key: &LogSessionKey) -> Option<ReattachHandle> {
+        let session_id = {
+            let by_key = self.by_key.lock().await;
+            by_key.get(key).cloned()?
+        };
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions.get_mut(&session_id)?;
+        if let Some(timer) = session.grace_timer.take() {
+            timer.abort();
+        }
+        let needs_stream = session.abort.is_none();
+        session.detached_at = None;
+        session.attach_count = session.attach_count.saturating_add(1);
+        session.info.from_cache = true;
+        session.info.total_lines = session.line_counter.load(Ordering::SeqCst);
+        if needs_stream {
+            session.info.status = "open".to_string();
+        } else if !session.paused.load(Ordering::SeqCst) {
+            session.info.status = "following".to_string();
+        }
+        tracing::info!(
+            target: "lancer::logs",
+            session_id = %session_id,
+            attach_count = session.attach_count,
+            needs_stream,
+            resume_since = ?session.last_log_timestamp,
+            "session re-attach (cache hit)"
+        );
+        Some(ReattachHandle {
+            info: session.info.clone(),
+            path: session.path.clone(),
+            line_counter: session.line_counter.clone(),
+            paused: session.paused.clone(),
+            resume_since: session.last_log_timestamp.clone(),
+            needs_stream,
+        })
     }
 
     pub async fn attach_follow_abort(
@@ -438,23 +591,137 @@ impl ManagedLogStore {
         })
     }
 
+    /// UI closed the viewer: Suspend + TTL (kube), or hard destroy (seed).
     pub async fn close(&self, session_id: &str) -> Result<(), AppError> {
+        let has_key = {
+            let sessions = self.sessions.lock().await;
+            sessions
+                .get(session_id)
+                .map(|s| s.key.is_some())
+                .ok_or_else(|| session_not_found(session_id))?
+        };
+        if has_key {
+            self.detach(session_id).await
+        } else {
+            self.destroy(session_id).await
+        }
+    }
+
+    /// Suspend: abort kube stream, keep L2 file, start TTL when last attach releases.
+    pub async fn detach(&self, session_id: &str) -> Result<(), AppError> {
+        let start_grace = {
+            let mut sessions = self.sessions.lock().await;
+            let session = sessions
+                .get_mut(session_id)
+                .ok_or_else(|| session_not_found(session_id))?;
+            if session.attach_count > 0 {
+                session.attach_count -= 1;
+            }
+            if session.attach_count > 0 {
+                tracing::debug!(
+                    target: "lancer::logs",
+                    session_id = %session_id,
+                    attach_count = session.attach_count,
+                    "suspend ignored; other viewers still attached"
+                );
+                false
+            } else if session.detached_at.is_some() {
+                false
+            } else {
+                if let Some(timer) = session.grace_timer.take() {
+                    timer.abort();
+                }
+                // Spec: physically disconnect K8s stream while Suspended.
+                if let Some(abort) = session.abort.take() {
+                    abort.abort();
+                }
+                session.paused.store(false, Ordering::SeqCst);
+                session.detached_at = Some(Instant::now());
+                session.info.from_cache = false;
+                session.info.status = "suspended".to_string();
+                let store = self.clone();
+                let sid = session_id.to_string();
+                session.grace_timer = Some(tokio::spawn(async move {
+                    tokio::time::sleep(GRACE_TTL).await;
+                    if let Err(err) = store.destroy(&sid).await {
+                        tracing::debug!(
+                            target: "lancer::logs",
+                            session_id = %sid,
+                            error = %err,
+                            "suspend ttl destroy skipped"
+                        );
+                    } else {
+                        tracing::info!(
+                            target: "lancer::logs",
+                            session_id = %sid,
+                            "suspend ttl teardown"
+                        );
+                    }
+                }));
+                tracing::info!(
+                    target: "lancer::logs",
+                    session_id = %session_id,
+                    ttl_secs = GRACE_TTL.as_secs(),
+                    last_ts = ?session.last_log_timestamp,
+                    "session suspended (stream aborted, cache kept)"
+                );
+                true
+            }
+        };
+        if start_grace {
+            self.enforce_detached_lru().await;
+        }
+        Ok(())
+    }
+
+    /// Abort stream, drop map entry, delete L2 temp file + index (Teardown).
+    pub async fn destroy(&self, session_id: &str) -> Result<(), AppError> {
         {
             let mut cancels = self.search_cancels.lock().await;
             if let Some(flag) = cancels.remove(session_id) {
                 flag.store(true, Ordering::SeqCst);
             }
         }
-        let mut sessions = self.sessions.lock().await;
-        let Some(mut session) = sessions.remove(session_id) else {
-            return Err(session_not_found(session_id));
+        let (key, path) = {
+            let mut sessions = self.sessions.lock().await;
+            let Some(mut session) = sessions.remove(session_id) else {
+                return Err(session_not_found(session_id));
+            };
+            if let Some(timer) = session.grace_timer.take() {
+                timer.abort();
+            }
+            let key = session.key.take();
+            if let Some(abort) = session.abort.take() {
+                abort.abort();
+            }
+            session.info.status = "closed".to_string();
+            (key, session.path.clone())
         };
-        if let Some(abort) = session.abort.take() {
-            abort.abort();
+        if let Some(key) = key {
+            self.by_key.lock().await.remove(&key);
         }
-        session.info.status = "closed".to_string();
-        // Keep the on-disk file for later inspection / export; do not delete yet.
+        let idx = index_path_for_log(&path);
+        let _ = tokio::fs::remove_file(&path).await;
+        let _ = tokio::fs::remove_file(&idx).await;
         Ok(())
+    }
+
+    async fn enforce_detached_lru(&self) {
+        let mut detached: Vec<(String, Instant)> = {
+            let sessions = self.sessions.lock().await;
+            sessions
+                .iter()
+                .filter_map(|(id, s)| s.detached_at.map(|t| (id.clone(), t)))
+                .collect()
+        };
+        if detached.len() <= MAX_DETACHED {
+            return;
+        }
+        detached.sort_by_key(|(_, t)| *t);
+        let evict = detached.len() - MAX_DETACHED;
+        for (id, _) in detached.into_iter().take(evict) {
+            let _ = self.destroy(&id).await;
+        }
     }
 
     pub async fn clear_all(&self) {
@@ -464,13 +731,15 @@ impl ManagedLogStore {
                 flag.store(true, Ordering::SeqCst);
             }
         }
-        let mut sessions = self.sessions.lock().await;
-        for (_, mut session) in sessions.drain() {
-            if let Some(abort) = session.abort.take() {
-                abort.abort();
-            }
+        let ids: Vec<String> = {
+            let sessions = self.sessions.lock().await;
+            sessions.keys().cloned().collect()
+        };
+        for id in ids {
+            let _ = self.destroy(&id).await;
         }
         self.search_cancels.lock().await.clear();
+        self.by_key.lock().await.clear();
     }
 
     async fn prepare_session_file(
@@ -571,6 +840,7 @@ pub fn start_kube_follow(
     previous: bool,
     since_seconds: Option<i64>,
     tail_lines: Option<i64>,
+    since_time: Option<String>,
     line_counter: Arc<AtomicU64>,
     paused: Arc<AtomicBool>,
 ) -> tokio::task::AbortHandle {
@@ -587,6 +857,7 @@ pub fn start_kube_follow(
         previous,
         since_seconds,
         tail_lines,
+        since_time,
         line_counter,
         paused,
     )
@@ -861,6 +1132,7 @@ mod tests {
                 namespace: Some("default".into()),
                 pod: Some("svc-1".into()),
                 container: Some("app".into()),
+                container_id: None,
                 follow: true,
                 seed_lines: Some(100),
                 previous: false,
@@ -881,6 +1153,7 @@ mod tests {
         assert_eq!(window.lines.len(), 10);
         assert_eq!(window.lines[0].line_number, 91);
 
+        let path = info.file_path.clone();
         store.close(&info.session_id).await.unwrap();
         let err = store.get_session(&info.session_id).await.unwrap_err();
         assert!(matches!(
@@ -890,7 +1163,8 @@ mod tests {
                 ..
             }
         ));
-        assert!(Path::new(&info.file_path).exists());
+        // Seed close → teardown deletes L2 temp file.
+        assert!(!Path::new(&path).exists());
 
         let _ = fs::remove_dir_all(root);
     }
@@ -898,6 +1172,52 @@ mod tests {
     #[test]
     fn sanitize_replaces_path_separators() {
         assert_eq!(sanitize_segment("a/b:c"), "a_b_c");
+    }
+
+    #[tokio::test]
+    async fn grace_reattach_reuses_session() {
+        let root = std::env::temp_dir().join(format!(
+            "lancer-managed-logs-grace-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        let store = ManagedLogStore::new();
+        store.set_root(root.clone()).await.unwrap();
+
+        let input = OpenManagedLogInput {
+            provider: "kubernetes".into(),
+            connection_id: Some("ctx-g".into()),
+            namespace: Some("default".into()),
+            pod: Some("svc-g".into()),
+            container: Some("app".into()),
+            container_id: Some("docker://abc123".into()),
+            follow: true,
+            seed_lines: None,
+            previous: false,
+            since_seconds: None,
+            tail_lines: Some(5_000),
+        };
+        let key = LogSessionKey::from_open_input(&input).unwrap();
+        let (info, path, _counter, _paused) = store.open_for_stream(input).await.unwrap();
+        assert!(!info.from_cache);
+        assert!(path.exists());
+
+        store.close(&info.session_id).await.unwrap();
+        // Suspended: session + L2 file kept; stream aborted (needs_stream on re-attach).
+        assert!(store.get_session(&info.session_id).await.is_ok());
+        assert!(path.exists());
+
+        let hit = store.try_reattach(&key).await.expect("cache hit");
+        assert!(hit.info.from_cache);
+        assert!(hit.needs_stream);
+        assert_eq!(hit.info.session_id, info.session_id);
+
+        store.destroy(&info.session_id).await.unwrap();
+        assert!(store.try_reattach(&key).await.is_none());
+        assert!(!path.exists());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test]
@@ -919,6 +1239,7 @@ mod tests {
                 namespace: Some("default".into()),
                 pod: Some("svc-2".into()),
                 container: Some("app".into()),
+                container_id: None,
                 follow: false,
                 seed_lines: Some(5_500),
                 previous: false,

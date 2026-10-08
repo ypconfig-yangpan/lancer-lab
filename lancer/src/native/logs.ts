@@ -30,6 +30,7 @@ interface LogSessionInfoDto {
   totalLines: number;
   truncated: boolean;
   filePath?: string;
+  fromCache?: boolean;
 }
 
 interface LogWindowDto {
@@ -138,7 +139,7 @@ export function createDefaultLogsNativeApi(): NativeLogsApi {
             tailLines: input.tailLines ?? null,
           },
         });
-        return { sessionId: info.sessionId };
+        return { sessionId: info.sessionId, fromCache: Boolean(info.fromCache) };
       });
     },
 

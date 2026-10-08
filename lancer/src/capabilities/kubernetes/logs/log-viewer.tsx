@@ -4,6 +4,7 @@ import {
   ChevronUp,
   Copy,
   Download,
+  FileDown,
   Maximize2,
   Minimize2,
   Pause,
@@ -26,6 +27,10 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
+import {
+  buildAiContextMarkdown,
+  type AiContextMeta,
+} from "@/capabilities/kubernetes/logs/ai-context-md";
 import { kubernetesApi } from "@/capabilities/kubernetes/api";
 import { Button } from "@/components/ui/button";
 import { CompactSelect } from "@/components/ui/compact-select";
@@ -34,10 +39,11 @@ import type { NativeLogSearchMatch } from "@/native/types";
 import { formatInstant } from "@/shared/lib/datetime";
 import { cn } from "@/shared/lib/utils";
 
-const UI_BUFFER_LIMIT = 20_000;
-const LINE_LIMITS = [500, 2_000, 5_000, 10_000] as const;
+const READ_WINDOW_SIZES = [2_000, 5_000, 10_000, 20_000] as const;
 const SEARCH_DEBOUNCE_MS = 300;
 const SEARCH_PAGE = 200;
+/** Rows from edge before sliding the Read Window (preload). */
+const EDGE_PRELOAD = 60;
 
 type SearchUiStatus = "idle" | "searching" | "ready" | "cancelled" | "error";
 
@@ -45,11 +51,21 @@ interface LogViewerProps {
   lines: LogLine[];
   onPausedChange?: (paused: boolean) => void;
   variant?: "default" | "terminal";
-  /** Shown in terminal chrome header (e.g. service / pod picker). */
+  /** Shown in terminal chrome header (e.g. pod picker). */
   toolbarStart?: ReactNode;
+  /**
+   * Source params (Since / Tail / Previous). Hidden in compact (homepage) until fullscreen.
+   */
+  toolbarSecondary?: ReactNode;
+  /**
+   * Narrow embed: lean header; Since/Tail/read-window only in fullscreen.
+   */
+  compactToolbar?: boolean;
   title?: string;
   /** Homepage: start collapsed to header-only strip. */
   defaultCollapsed?: boolean;
+  /** Notify parent when user collapses/expands (for lazy openLogs). */
+  onCollapsedChange?: (collapsed: boolean) => void;
   /** Show collapse chevron (dock widget usually hides it). */
   enableCollapse?: boolean;
   /** Show fullscreen control (terminal variant). */
@@ -64,8 +80,10 @@ interface LogViewerProps {
   sessionId?: string | null;
   /** Seek read window to line (1-based) when match is outside buffer. */
   onSeekToLine?: (lineNumber: number) => void;
-  /** Flat source label for Copy Context (pod/container). */
+  /** Flat source label for AI Context MD (pod/container). */
   sourceLabel?: string;
+  /** Extra meta for standard AI Context Markdown export. */
+  aiContextMeta?: AiContextMeta;
   /** Stream status from managed-log session (following / error / open…). */
   streamStatus?: string | null;
   /** Re-open follow without clearing the visible buffer. */
@@ -74,13 +92,26 @@ interface LogViewerProps {
   totalLines?: number;
   /** Jump to timestamp (ISO or HH:mm[:ss]); returns found line or null. */
   onJumpToTime?: (target: string) => Promise<number | null>;
-  /** Disk window has earlier lines — show Load older. */
-  canLoadOlder?: boolean;
-  onLoadOlder?: () => void;
-  /** Leave history browse / seek and pin to live tail. */
+  /** Sliding Read Window size (pane-owned). */
+  readWindowSize?: number;
+  onReadWindowSizeChange?: (size: number) => void;
+  windowOffset?: number;
+  canSlideOlder?: boolean;
+  canSlideNewer?: boolean;
+  onSlideOlder?: () => void;
+  onSlideNewer?: () => void;
+  /** Stop pin-to-tail refetch; freeze window at current offset (required before sliding). */
+  onFreezeReadWindow?: () => void;
+  /** Leave history browse and pin to live tail. */
   onPinLiveTail?: () => void;
   historyBrowsing?: boolean;
+  /** Soft Clear mask active (history hidden above divider). */
+  onViewportMaskChange?: (masked: boolean) => void;
 }
+
+type ViewportRow =
+  | { kind: "divider"; id: string }
+  | { kind: "line"; id: string; line: LogLine };
 
 /** Soft highlight for HTTP tokens / key:value — design-draft polish. */
 function highlightMessage(message: string): ReactNode {
@@ -151,8 +182,11 @@ export function LogViewer({
   onPausedChange,
   variant = "default",
   toolbarStart,
+  toolbarSecondary,
+  compactToolbar = false,
   title = "实时日志",
   defaultCollapsed = false,
+  onCollapsedChange,
   enableCollapse = true,
   enableFullscreen = true,
   expandedClassName = "h-[min(420px,44vh)]",
@@ -161,14 +195,22 @@ export function LogViewer({
   sessionId = null,
   onSeekToLine,
   sourceLabel,
+  aiContextMeta,
   streamStatus = null,
   onReconnect,
   totalLines,
   onJumpToTime,
-  canLoadOlder = false,
-  onLoadOlder,
+  readWindowSize = 5_000,
+  onReadWindowSizeChange,
+  windowOffset = 0,
+  canSlideOlder = false,
+  canSlideNewer = false,
+  onSlideOlder,
+  onSlideNewer,
+  onFreezeReadWindow,
   onPinLiveTail,
   historyBrowsing = false,
+  onViewportMaskChange,
 }: LogViewerProps) {
   const { t } = useTranslation();
   const parentRef = useRef<HTMLDivElement | null>(null);
@@ -176,16 +218,29 @@ export function LogViewer({
   const jumpInputRef = useRef<HTMLInputElement | null>(null);
   const unfollowAtLineRef = useRef<number | null>(null);
   const searchGenRef = useRef(0);
+  const slideLockRef = useRef(false);
+  const pendingAnchorLineRef = useRef<number | null>(null);
   const [paused, setPaused] = useState(false);
   const [followTail, setFollowTail] = useState(true);
   const [newLineCount, setNewLineCount] = useState(0);
   const [levelFilter, setLevelFilter] = useState<LogLevel | "ALL">("ALL");
   const [keyword, setKeyword] = useState("");
-  const [lineLimit, setLineLimit] = useState<(typeof LINE_LIMITS)[number]>(2_000);
-  const [clearedAt, setClearedAt] = useState(0);
+  /**
+   * Soft Viewport Mask (Clear): hide lines with lineNumber ≤ mask.
+   * Disk unchanged; new lines append below divider.
+   */
+  const [clearMaskAt, setClearMaskAt] = useState<number | null>(null);
   const [collapsed, setCollapsed] = useState(defaultCollapsed);
   const [fullscreen, setFullscreen] = useState(false);
   const terminal = variant === "terminal";
+
+  useEffect(() => {
+    onCollapsedChange?.(collapsed);
+  }, [collapsed, onCollapsedChange]);
+
+  useEffect(() => {
+    onViewportMaskChange?.(clearMaskAt !== null);
+  }, [clearMaskAt, onViewportMaskChange]);
 
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
@@ -220,6 +275,8 @@ export function LogViewer({
   useEffect(() => {
     resetSearch();
     setSearchOpen(false);
+    setClearMaskAt(null);
+    setFollowTail(true);
   }, [sessionId, resetSearch]);
 
   useEffect(() => {
@@ -278,6 +335,7 @@ export function LogViewer({
       }
       const max = totalLines && totalLines > 0 ? totalLines : n;
       const clamped = Math.min(Math.floor(n), max);
+      setClearMaskAt(null);
       setFollowFlow(false);
       onSeekToLine?.(clamped);
       setJumpOpen(false);
@@ -293,6 +351,7 @@ export function LogViewer({
         setJumpError("No log line at or after that time");
         return;
       }
+      setClearMaskAt(null);
       setFollowFlow(false);
       onSeekToLine?.(line);
       setJumpOpen(false);
@@ -316,21 +375,12 @@ export function LogViewer({
     }
   };
 
-  const bounded = useMemo(() => {
-    const afterClear = clearedAt > 0 ? lines.filter((l) => l.lineNumber > clearedAt) : lines;
-    const capped =
-      afterClear.length <= UI_BUFFER_LIMIT
-        ? afterClear
-        : afterClear.slice(afterClear.length - UI_BUFFER_LIMIT);
-    // Search mode: keep full data window so matches are not clipped by lineLimit.
-    if (terminal && !searchOpen) {
-      return capped.length <= lineLimit ? capped : capped.slice(capped.length - lineLimit);
-    }
-    return capped;
-  }, [clearedAt, lineLimit, lines, terminal, searchOpen]);
-
+  // Read Window from pane is already sized — do not grow/clip a second buffer here.
   const filtered = useMemo(() => {
-    return bounded.filter((line) => {
+    return lines.filter((line) => {
+      if (clearMaskAt !== null && line.lineNumber <= clearMaskAt) {
+        return false;
+      }
       if (levelFilter !== "ALL" && line.level !== levelFilter) {
         return false;
       }
@@ -339,16 +389,36 @@ export function LogViewer({
       }
       return true;
     });
-  }, [bounded, keyword, levelFilter]);
+  }, [lines, keyword, levelFilter, clearMaskAt]);
+
+  const viewportRows = useMemo((): ViewportRow[] => {
+    const rows: ViewportRow[] = [];
+    if (clearMaskAt !== null) {
+      rows.push({ kind: "divider", id: "viewport-clear-divider" });
+    }
+    for (const line of filtered) {
+      rows.push({ kind: "line", id: line.id, line });
+    }
+    return rows;
+  }, [filtered, clearMaskAt]);
 
   const showBody = !collapsed || fullscreen;
 
   const virtualizer = useVirtualizer({
-    count: filtered.length,
+    count: viewportRows.length,
     getScrollElement: () => parentRef.current,
-    estimateSize: () => 24,
+    estimateSize: (index) => (viewportRows[index]?.kind === "divider" ? 28 : 24),
     overscan: 24,
   });
+
+  const rowIndexForLine = useCallback(
+    (lineNumber: number) => {
+      const fi = filtered.findIndex((l) => l.lineNumber === lineNumber);
+      if (fi < 0) return -1;
+      return clearMaskAt !== null ? fi + 1 : fi;
+    },
+    [filtered, clearMaskAt],
+  );
 
   useEffect(() => {
     if (followTail) {
@@ -356,44 +426,75 @@ export function LogViewer({
       setNewLineCount(0);
       return;
     }
-    const lastNum = lines[lines.length - 1]?.lineNumber ?? 0;
+    const lastNum = totalLines ?? lines[lines.length - 1]?.lineNumber ?? 0;
     if (unfollowAtLineRef.current === null) {
       unfollowAtLineRef.current = lastNum;
       setNewLineCount(0);
       return;
     }
     setNewLineCount(Math.max(0, lastNum - unfollowAtLineRef.current));
-  }, [followTail, lines]);
+  }, [followTail, totalLines, lines]);
 
   useEffect(() => {
-    if (!followTail || filtered.length === 0 || !showBody || searchOpen) {
+    if (!followTail || viewportRows.length === 0 || !showBody || searchOpen) {
       return;
     }
-    virtualizer.scrollToIndex(filtered.length - 1, { align: "end" });
+    virtualizer.scrollToIndex(viewportRows.length - 1, { align: "end" });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [filtered.length, followTail, showBody, searchOpen]);
+  }, [viewportRows.length, followTail, showBody, searchOpen, clearMaskAt]);
+
+  // Release slide lock if anchor never resolved (e.g. empty window).
+  useEffect(() => {
+    if (!slideLockRef.current) return;
+    const t = window.setTimeout(() => {
+      slideLockRef.current = false;
+    }, 900);
+    return () => window.clearTimeout(t);
+  }, [windowOffset, filtered.length]);
 
   const filteredRef = useRef(filtered);
   filteredRef.current = filtered;
+  const viewportRowsRef = useRef(viewportRows);
+  viewportRowsRef.current = viewportRows;
   const onSeekRef = useRef(onSeekToLine);
   onSeekRef.current = onSeekToLine;
   const virtualizerRef = useRef(virtualizer);
   virtualizerRef.current = virtualizer;
   const pendingFocusLineRef = useRef<number | null>(null);
+  const windowOffsetRef = useRef(windowOffset);
+  windowOffsetRef.current = windowOffset;
 
-  const focusMatch = useCallback((match: NativeLogSearchMatch | undefined) => {
-    if (!match) return;
-    setFollowTail(false);
-    const idx = filteredRef.current.findIndex((l) => l.lineNumber === match.lineNumber);
-    if (idx >= 0) {
-      pendingFocusLineRef.current = null;
-      virtualizerRef.current.scrollToIndex(idx, { align: "center" });
-      return;
-    }
-    // Match outside current data window → seek read window, then scroll when lines arrive.
-    pendingFocusLineRef.current = match.lineNumber;
-    onSeekRef.current?.(match.lineNumber);
-  }, []);
+  // Scroll Anchor: after slide, keep the anchored line at the same visual place.
+  useEffect(() => {
+    const anchor = pendingAnchorLineRef.current;
+    if (anchor === null) return;
+    const idx = rowIndexForLine(anchor);
+    if (idx < 0) return;
+    virtualizer.scrollToIndex(idx, { align: "start" });
+    pendingAnchorLineRef.current = null;
+    slideLockRef.current = false;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filtered, windowOffset, rowIndexForLine]);
+
+  const focusMatch = useCallback(
+    (match: NativeLogSearchMatch | undefined) => {
+      if (!match) return;
+      setFollowTail(false);
+      setClearMaskAt((mask) => {
+        if (mask !== null && match.lineNumber <= mask) return null;
+        return mask;
+      });
+      const idx = rowIndexForLine(match.lineNumber);
+      if (idx >= 0) {
+        pendingFocusLineRef.current = null;
+        virtualizerRef.current.scrollToIndex(idx, { align: "center" });
+        return;
+      }
+      pendingFocusLineRef.current = match.lineNumber;
+      onSeekRef.current?.(match.lineNumber);
+    },
+    [rowIndexForLine],
+  );
 
   // After seek / window update, center the pending (or current) match.
   useEffect(() => {
@@ -401,12 +502,12 @@ export function LogViewer({
     const target =
       pendingFocusLineRef.current ?? matches[matchIndex]?.lineNumber ?? null;
     if (target === null) return;
-    const idx = filtered.findIndex((l) => l.lineNumber === target);
+    const idx = rowIndexForLine(target);
     if (idx < 0) return;
     pendingFocusLineRef.current = null;
     virtualizer.scrollToIndex(idx, { align: "center" });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [filtered, matchIndex, matches, searchOpen]);
+  }, [filtered, matchIndex, matches, searchOpen, rowIndexForLine]);
 
   // Stable search: only re-run when query/options/session change — NOT on every Follow poll.
   useEffect(() => {
@@ -548,30 +649,39 @@ export function LogViewer({
     resetSearch();
   };
 
-  const copyContext = () => {
+  const buildContextMd = () => {
     const match = matches[matchIndex];
-    const centerLine = match?.lineNumber ?? filtered[Math.floor(filtered.length / 2)]?.lineNumber;
-    if (centerLine === undefined) return;
-    const before = 50;
-    const after = 50;
-    const slice = filtered.filter(
-      (l) => l.lineNumber >= centerLine - before && l.lineNumber <= centerLine + after,
-    );
-    const header = [
-      sourceLabel ? `Source: ${sourceLabel}` : null,
-      match ? `Match line: ${match.lineNumber}` : null,
-      searchQuery ? `Query: ${searchQuery}` : null,
-      "",
-    ]
-      .filter((x) => x !== null)
-      .join("\n");
-    const body = slice
-      .map(
-        (l) =>
-          `${formatInstant(l.timestamp, "yyyy-MM-dd HH:mm:ss")}  [${l.level}]  ${l.message}`,
-      )
-      .join("\n");
-    void navigator.clipboard.writeText(`${header}${body}`);
+    const focusLineNumber =
+      match?.lineNumber ?? filtered[Math.floor(filtered.length / 2)]?.lineNumber;
+    return buildAiContextMarkdown({
+      meta: {
+        ...(aiContextMeta ?? {}),
+        ...(sourceLabel ? { sourceLabel } : {}),
+      },
+      lines: filtered,
+      ...(focusLineNumber !== undefined ? { focusLineNumber } : {}),
+      ...(searchQuery.trim() ? { searchQuery: searchQuery.trim() } : {}),
+      contextRadius: 50,
+    });
+  };
+
+  /** Copy standard AI Context Markdown for external AI Coder. */
+  const copyContext = () => {
+    if (filtered.length === 0) return;
+    void navigator.clipboard.writeText(buildContextMd());
+  };
+
+  /** Download the same package as `.md` file. */
+  const downloadContextMd = () => {
+    if (filtered.length === 0) return;
+    const md = buildContextMd();
+    const blob = new Blob([md], { type: "text/markdown;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `lancer-ai-context-${Date.now()}.md`;
+    a.click();
+    URL.revokeObjectURL(url);
   };
 
   const levelBadge = (level: LogLevel) => {
@@ -598,23 +708,58 @@ export function LogViewer({
     });
   };
 
-  const clearLocal = () => {
-    // View-only: hide lines ≤ clearedAt. Disk / session untouched.
-    const last = lines[lines.length - 1];
-    setClearedAt(last?.lineNumber ?? Number.MAX_SAFE_INTEGER);
-    setFollowTail(true);
+  /** Soft Clear: mask history in viewport; L2 disk untouched. */
+  const clearViewport = () => {
+    const at = totalLines ?? lines[lines.length - 1]?.lineNumber ?? 0;
+    setClearMaskAt(at);
+    setFollowFlow(true);
+    onPinLiveTail?.();
     setNewLineCount(0);
     unfollowAtLineRef.current = null;
   };
 
-  const restoreCleared = () => {
-    setClearedAt(0);
+  const restoreMaskedHistory = () => {
+    setClearMaskAt(null);
   };
 
   const jumpToLatest = () => {
+    setClearMaskAt(null);
     setFollowFlow(true);
     onPinLiveTail?.();
     onSeekToLine?.(0);
+  };
+
+  const requestSlideOlder = () => {
+    if (!onSlideOlder || slideLockRef.current) return;
+    // Sliding into older history → drop soft mask.
+    setClearMaskAt(null);
+    // Freeze first so we leave pin-to-tail; then slide using frozen/current offset.
+    if (!historyBrowsing) {
+      onFreezeReadWindow?.();
+    }
+    if (!canSlideOlder && windowOffset <= 0) return;
+    const items = virtualizerRef.current.getVirtualItems();
+    const firstIdx = items[0]?.index ?? 0;
+    const row = viewportRowsRef.current[firstIdx];
+    pendingAnchorLineRef.current =
+      row?.kind === "line" ? row.line.lineNumber : filteredRef.current[0]?.lineNumber ?? null;
+    slideLockRef.current = true;
+    setFollowTail(false);
+    onSlideOlder();
+  };
+
+  const requestSlideNewer = () => {
+    if (!canSlideNewer || !onSlideNewer || slideLockRef.current || followTail) return;
+    const items = virtualizerRef.current.getVirtualItems();
+    const last = items[items.length - 1];
+    const lastIdx = last?.index ?? viewportRowsRef.current.length - 1;
+    const row = viewportRowsRef.current[lastIdx];
+    pendingAnchorLineRef.current =
+      row?.kind === "line"
+        ? row.line.lineNumber
+        : filteredRef.current[filteredRef.current.length - 1]?.lineNumber ?? null;
+    slideLockRef.current = true;
+    onSlideNewer();
   };
 
   // Previous dumps end as status=open — not an interrupt. Only error needs Reconnect.
@@ -641,15 +786,41 @@ export function LogViewer({
     event.stopPropagation();
   };
 
+  const [nearTop, setNearTop] = useState(false);
+
+  const tryEdgeSlide = (following: boolean) => {
+    if (following || slideLockRef.current) return;
+    const items = virtualizerRef.current.getVirtualItems();
+    if (items.length === 0) return;
+    const first = items[0]!.index;
+    const last = items[items.length - 1]!.index;
+    const n = viewportRowsRef.current.length;
+    const atTop = first < EDGE_PRELOAD;
+    setNearTop(atTop);
+    if (atTop && canSlideOlder) {
+      requestSlideOlder();
+    }
+    if (n > 0 && last > n - EDGE_PRELOAD && canSlideNewer) {
+      requestSlideNewer();
+    }
+  };
+
   const updateFollowFromScroll = () => {
     const el = parentRef.current;
-    if (!el || !followTail) {
-      return;
+    if (!el) return;
+
+    let following = followTail;
+    if (following) {
+      const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
+      if (!nearBottom) {
+        setFollowTail(false);
+        following = false;
+        // Critical: freeze window or 200ms tail refetch keeps resetting to "latest N".
+        onFreezeReadWindow?.();
+      }
     }
-    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
-    if (!nearBottom) {
-      setFollowTail(false);
-    }
+    // Same scroll frame: after leaving Follow, allow edge slide (don't wait next event).
+    tryEdgeSlide(following);
   };
 
   const iconBtn = (active?: boolean) =>
@@ -691,6 +862,8 @@ export function LogViewer({
 
   if (terminal) {
     const showNewLinesBadge = !followTail && newLineCount > 0;
+    /** Homepage compact: hide Since/Tail/read-window until fullscreen. */
+    const showExtendedChrome = !compactToolbar || fullscreen;
     const panel = (
       <div
         className={cn(
@@ -703,114 +876,148 @@ export function LogViewer({
       >
         <div
           className={cn(
-            "flex shrink-0 items-center gap-1.5 border-b border-border-subtle px-2.5",
-            density === "dock" ? "h-9 flex-wrap py-1" : "h-10 gap-2 px-3",
+            "flex shrink-0 items-center gap-1.5 border-b border-border-subtle px-3",
+            "h-10 min-h-10",
           )}
         >
           <span className="shrink-0 text-[13px] font-semibold text-foreground">{title}</span>
-          {toolbarStart}
-          <CompactSelect
-            value={lineLimit}
-            onChange={(e) =>
-              setLineLimit(Number(e.target.value) as (typeof LINE_LIMITS)[number])
-            }
-            title="视口最多渲染行数（不删磁盘；搜索时自动放开）"
-            triggerClassName="w-[96px]"
-          >
-            {LINE_LIMITS.map((n) => (
-              <option key={n} value={n}>
-                视口 {n}
-              </option>
-            ))}
-          </CompactSelect>
-          <button
-            type="button"
-            className={iconBtn(searchOpen)}
-            onClick={() => {
-              setJumpOpen(false);
-              setSearchOpen(true);
-              setCollapsed(false);
-              queueMicrotask(() => searchInputRef.current?.focus());
-            }}
-            title="Search (⌘F)"
-          >
-            <Search className="size-3.5" />
-          </button>
-          <button
-            type="button"
-            className={iconBtn(jumpOpen)}
-            onClick={() => {
-              setSearchOpen(false);
-              setJumpOpen(true);
-              setJumpError(null);
-              setCollapsed(false);
-              queueMicrotask(() => jumpInputRef.current?.focus());
-            }}
-            title="Jump (⌘L)"
-          >
-            <span className="text-[10px] font-semibold tabular-nums">#</span>
-          </button>
-          <button
-            type="button"
-            className={iconBtn(paused)}
-            onClick={togglePause}
-            title={paused ? t("logs.resume") : t("logs.pause")}
-          >
-            {paused ? <Play className="size-3.5" /> : <Pause className="size-3.5" />}
-          </button>
-          {clearedAt > 0 ? (
-            <button
-              type="button"
-              className={iconBtn(true)}
-              onClick={restoreCleared}
-              title="恢复清空前的视口（磁盘日志一直在）"
-            >
-              <RotateCcw className="size-3.5" />
-            </button>
-          ) : (
-            <button
-              type="button"
-              className={iconBtn()}
-              onClick={clearLocal}
-              title="清空视口：只藏当前已显示行，不删本地缓存"
-            >
-              <SquareX className="size-3.5" />
-            </button>
-          )}
-          <button type="button" className={iconBtn()} onClick={downloadLogs} title="下载">
-            <Download className="size-3.5" />
-          </button>
-          {searchOpen || matches.length > 0 ? (
-            <button
-              type="button"
-              className={iconBtn()}
-              onClick={copyContext}
-              title="Copy Context"
-            >
-              <Copy className="size-3.5" />
-            </button>
+          {/* Collapsed / minimize: title + chevron only — no options. */}
+          {!collapsed ? (
+            <>
+              {toolbarStart}
+              {showExtendedChrome ? toolbarSecondary : null}
+              {showExtendedChrome ? (
+                <CompactSelect
+                  value={readWindowSize}
+                  onChange={(e) => onReadWindowSizeChange?.(Number(e.target.value))}
+                  title="阅读窗口：当前内存中滑动窗口大小（不是磁盘上限）"
+                  triggerClassName="w-[108px]"
+                >
+                  {READ_WINDOW_SIZES.map((n) => (
+                    <option key={n} value={n}>
+                      阅读窗 {n >= 1000 ? `${n / 1000}k` : n}
+                    </option>
+                  ))}
+                </CompactSelect>
+              ) : null}
+              <button
+                type="button"
+                className={iconBtn(searchOpen)}
+                onClick={() => {
+                  setJumpOpen(false);
+                  setSearchOpen(true);
+                  setCollapsed(false);
+                  queueMicrotask(() => searchInputRef.current?.focus());
+                }}
+                title="Search (⌘F)"
+              >
+                <Search className="size-3.5" />
+              </button>
+              {showExtendedChrome ? (
+                <button
+                  type="button"
+                  className={iconBtn(jumpOpen)}
+                  onClick={() => {
+                    setSearchOpen(false);
+                    setJumpOpen(true);
+                    setJumpError(null);
+                    setCollapsed(false);
+                    queueMicrotask(() => jumpInputRef.current?.focus());
+                  }}
+                  title="Jump (⌘L)"
+                >
+                  <span className="text-[10px] font-semibold tabular-nums">#</span>
+                </button>
+              ) : null}
+              <button
+                type="button"
+                className={iconBtn(paused)}
+                onClick={togglePause}
+                title={paused ? t("logs.resume") : t("logs.pause")}
+              >
+                {paused ? <Play className="size-3.5" /> : <Pause className="size-3.5" />}
+              </button>
+              {clearMaskAt !== null ? (
+                <button
+                  type="button"
+                  className={iconBtn(true)}
+                  onClick={restoreMaskedHistory}
+                  title="恢复已隐藏的视口历史"
+                >
+                  <RotateCcw className="size-3.5" />
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  className={iconBtn()}
+                  onClick={clearViewport}
+                  title="清空视口（不删本地缓存）；新日志在分割线下继续"
+                >
+                  <SquareX className="size-3.5" />
+                </button>
+              )}
+              {showExtendedChrome ? (
+                <button type="button" className={iconBtn()} onClick={downloadLogs} title="下载">
+                  <Download className="size-3.5" />
+                </button>
+              ) : null}
+              <button
+                type="button"
+                className={iconBtn()}
+                onClick={copyContext}
+                title="复制 AI Context（标准 Markdown，给外部 AI Coder）"
+              >
+                <Copy className="size-3.5" />
+              </button>
+              {showExtendedChrome ? (
+                <button
+                  type="button"
+                  className={iconBtn()}
+                  onClick={downloadContextMd}
+                  title="下载 AI Context.md（给外部 AI Coder）"
+                >
+                  <FileDown className="size-3.5" />
+                </button>
+              ) : null}
+            </>
           ) : null}
 
-          <div className="ml-auto flex items-center gap-1.5">
-            {statusHint ? (
+          <div className="ml-auto flex shrink-0 items-center gap-1.5">
+            {collapsed ? null : showExtendedChrome && statusHint ? (
               <span
-                className="hidden max-w-[260px] truncate text-[10px] text-muted-foreground sm:inline"
+                className="hidden max-w-[200px] truncate text-[10px] text-muted-foreground xl:inline"
                 title={statusHint}
               >
                 {statusHint}
               </span>
+            ) : !collapsed && compactToolbar && !fullscreen ? (
+              <span
+                className="text-[10px] text-muted-foreground"
+                title={statusHint ?? undefined}
+              >
+                {streamStatus === "error"
+                  ? "断流"
+                  : followTail
+                    ? "● 实时跟随"
+                    : "⏸ 已暂停"}
+              </span>
             ) : null}
-            <span
-              className="text-[10px] tabular-nums text-muted-foreground"
-              title={
-                totalLines
-                  ? `视口显示 ${filtered.length} · 磁盘共 ${totalLines}`
-                  : `视口显示 ${filtered.length}`
-              }
-            >
-              {filtered.length}
-              {totalLines ? ` / ${totalLines}` : ""} 行
-            </span>
+            {!collapsed ? (
+              <span
+                className="text-[10px] tabular-nums text-muted-foreground"
+                title={
+                  clearMaskAt !== null
+                    ? `视口已隐藏历史 · 本地已缓存 ${totalLines ?? 0} 行`
+                    : totalLines
+                      ? `渲染 ${filtered.length} · 本地 ${totalLines}`
+                      : `渲染 ${filtered.length}`
+                }
+              >
+                {clearMaskAt !== null
+                  ? `隐藏 · ${filtered.length}${totalLines ? ` / ${totalLines}` : ""}`
+                  : `${filtered.length}${totalLines ? ` / ${totalLines}` : ""}`}
+              </span>
+            ) : null}
             {enableCollapse && !fullscreen ? (
               <button
                 type="button"
@@ -825,7 +1032,7 @@ export function LogViewer({
                 )}
               </button>
             ) : null}
-            {enableFullscreen ? (
+            {!collapsed && enableFullscreen ? (
               <button
                 type="button"
                 className={iconBtn(fullscreen)}
@@ -833,7 +1040,13 @@ export function LogViewer({
                   setFullscreen((v) => !v);
                   if (!fullscreen) setCollapsed(false);
                 }}
-                title={fullscreen ? "退出全屏 (Esc)" : "全屏"}
+                title={
+                  fullscreen
+                    ? "退出全屏 (Esc)"
+                    : compactToolbar
+                      ? "全屏（Since / Tail 等）"
+                      : "全屏"
+                }
               >
                 {fullscreen ? (
                   <Minimize2 className="size-3.5" />
@@ -1019,31 +1232,9 @@ export function LogViewer({
               onWheelCapture={onWheelCapture}
               onScroll={updateFollowFromScroll}
             >
-              {canLoadOlder && onLoadOlder ? (
-                <div className="sticky top-0 z-[1] mb-2 flex justify-center">
-                  <button
-                    type="button"
-                    onClick={onLoadOlder}
-                    className="rounded-full border border-white/10 bg-[#1e293b]/95 px-3 py-1 text-[11px] text-[#e2e8f0] shadow-sm hover:bg-[#334155]"
-                  >
-                    ↑ 加载更早日志
-                  </button>
-                </div>
-              ) : null}
-              {clearedAt > 0 ? (
-                <div className="mb-2 flex justify-center">
-                  <button
-                    type="button"
-                    onClick={restoreCleared}
-                    className="rounded-full border border-white/10 bg-[#334155]/80 px-3 py-1 text-[11px] text-[#cbd5e1] hover:bg-[#475569]"
-                  >
-                    视口已清空 · 点击恢复（磁盘未删）
-                  </button>
-                </div>
-              ) : null}
-              {filtered.length === 0 ? (
-                <div className="flex h-full min-w-full items-center justify-center text-[#64748b]">
-                  {clearedAt > 0 ? "视口已清空，新日志会继续显示" : "—"}
+              {viewportRows.length === 0 ? (
+                <div className="flex h-full min-w-full flex-col items-center justify-center gap-3 text-[#64748b]">
+                  <span>—</span>
                 </div>
               ) : (
                 <div
@@ -1054,10 +1245,34 @@ export function LogViewer({
                   }}
                 >
                   {virtualizer.getVirtualItems().map((virtualRow) => {
-                    const line = filtered[virtualRow.index];
-                    if (!line) {
+                    const row = viewportRows[virtualRow.index];
+                    if (!row) {
                       return null;
                     }
+                    if (row.kind === "divider") {
+                      return (
+                        <div
+                          key={row.id}
+                          className="absolute left-0 top-0 flex w-max min-w-full items-center justify-center gap-2 whitespace-pre text-[#94a3b8]"
+                          style={{
+                            height: `${virtualRow.size}px`,
+                            transform: `translateY(${virtualRow.start}px)`,
+                          }}
+                        >
+                          <span className="text-[#475569]">---</span>
+                          <span>视口已清空</span>
+                          <button
+                            type="button"
+                            onClick={restoreMaskedHistory}
+                            className="rounded px-1 text-[#7dd3fc] underline decoration-[#7dd3fc]/40 underline-offset-2 hover:text-[#bae6fd]"
+                          >
+                            点击恢复历史
+                          </button>
+                          <span className="text-[#475569]">---</span>
+                        </div>
+                      );
+                    }
+                    const line = row.line;
                     const isCurrent = currentMatchLine === line.lineNumber;
                     const isHit =
                       searchOpen &&
@@ -1102,6 +1317,28 @@ export function LogViewer({
                 </div>
               )}
             </div>
+            {nearTop && !followTail && clearMaskAt === null ? (
+              canSlideOlder ? (
+                <button
+                  type="button"
+                  onClick={requestSlideOlder}
+                  className="absolute top-3 left-1/2 z-10 -translate-x-1/2 rounded-full border border-white/10 bg-[#1e293b]/90 px-3 py-1 text-[11px] text-[#e2e8f0] hover:bg-[#334155]"
+                >
+                  ↑ 向前滑动阅读窗
+                </button>
+              ) : (
+                <div className="absolute top-3 left-1/2 z-10 flex max-w-[min(92%,420px)] -translate-x-1/2 flex-col items-center gap-0.5 rounded-full border border-white/10 bg-[#1e293b]/95 px-3 py-1.5 text-center text-[11px] text-[#e2e8f0] shadow-[0_4px_16px_rgba(0,0,0,0.35)]">
+                  <span>
+                    已到本次 session 第 1 行（本地共 {totalLines ?? 0} 行）
+                  </span>
+                  <span className="text-[10px] text-[#94a3b8]">
+                    {(totalLines ?? 0) <= readWindowSize
+                      ? "本地行数 ≤ 阅读窗，没有更早可滑；要 Pod 更早历史请加大「拉取 Tail / Since」后重开"
+                      : "继续上滑应向前换窗；若仍不动请点上方「向前滑动」"}
+                  </span>
+                </div>
+              )
+            ) : null}
             {showNewLinesBadge || historyBrowsing ? (
               <button
                 type="button"
@@ -1109,12 +1346,13 @@ export function LogViewer({
                 className="absolute bottom-5 left-1/2 z-10 flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-white/10 bg-[#1e293b]/95 px-3 py-1.5 text-[11px] font-medium text-[#e2e8f0] shadow-[0_4px_16px_rgba(0,0,0,0.35)] backdrop-blur-sm transition-colors hover:bg-[#334155]"
               >
                 {historyBrowsing ? (
-                  <span>回到最新 · 恢复 Follow</span>
+                  <span>⬇ 回到最新 · 恢复实时</span>
                 ) : (
                   <>
-                    <span className="tabular-nums">↓ {newLineCount} new lines</span>
-                    <span className="text-[#94a3b8]">·</span>
-                    <span>Jump to latest</span>
+                    <span className="tabular-nums">⬇ 回到最新 · 恢复实时</span>
+                    {newLineCount > 0 ? (
+                      <span className="text-[#94a3b8]">(有 {newLineCount} 条新日志)</span>
+                    ) : null}
                   </>
                 )}
               </button>
