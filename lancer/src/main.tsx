@@ -69,20 +69,6 @@ declare module "@tanstack/react-router" {
   }
 }
 
-async function bindWindowClose(): Promise<void> {
-  try {
-    const { getCurrentWindow } = await import("@tauri-apps/api/window");
-    const current = getCurrentWindow();
-    // 关窗 = 隐藏，进程保留（和常见桌面应用一致）；真正退出走菜单「退出」
-    await current.onCloseRequested(async (event) => {
-      event.preventDefault();
-      await current.hide();
-    });
-  } catch {
-    // 非 Tauri 环境忽略
-  }
-}
-
 async function boot(): Promise<void> {
   const rootElement = document.getElementById("root");
   if (!rootElement) {
@@ -103,7 +89,6 @@ async function boot(): Promise<void> {
   );
 
   desktop.app.markRunning();
-  await bindWindowClose();
   logger.operation("app running");
 }
 

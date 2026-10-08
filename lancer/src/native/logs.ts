@@ -2,7 +2,11 @@ import type { LogLevel, LogLine, LogSessionInfo, LogWindow } from "@/entities/lo
 import { invokeCommand, TauriInvokeError } from "@/shared/tauri";
 import { NativeCapabilityError, type NativeErrorCode } from "./errors";
 import type {
+  NativeLogFindAtTimeInput,
+  NativeLogFindAtTimeResult,
   NativeLogOpenInput,
+  NativeLogSearchInput,
+  NativeLogSearchResult,
   NativeLogsApi,
   NativeLogSession,
   NativeLogWindowInput,
@@ -129,6 +133,9 @@ export function createDefaultLogsNativeApi(): NativeLogsApi {
             container: input.container ?? null,
             follow: input.follow ?? true,
             seedLines: null,
+            previous: input.previous ?? false,
+            sinceSeconds: input.sinceSeconds ?? null,
+            tailLines: input.tailLines ?? null,
           },
         });
         return { sessionId: info.sessionId };
@@ -177,6 +184,58 @@ export function createDefaultLogsNativeApi(): NativeLogsApi {
           input: { sessionId, paused },
         });
         return mapSession(dto);
+      });
+    },
+
+    search(input: NativeLogSearchInput): Promise<NativeLogSearchResult> {
+      return bridgeCall("logs.search", async () => {
+        const dto = await invokeCommand<{
+          matches: { lineNumber: number; byteOffset: number }[];
+          nextCursorByte: number | null;
+          hasMore: boolean;
+          truncated: boolean;
+        }>("search_managed_log", {
+          input: {
+            sessionId: input.sessionId,
+            pattern: input.pattern,
+            regex: input.regex ?? false,
+            caseSensitive: input.caseSensitive ?? false,
+            maxMatches: input.maxMatches ?? 200,
+            cursorByte: input.cursorByte ?? 0,
+          },
+        });
+        return {
+          matches: dto.matches.map((m) => ({
+            lineNumber: m.lineNumber,
+            byteOffset: m.byteOffset,
+          })),
+          nextCursorByte: dto.nextCursorByte,
+          hasMore: dto.hasMore,
+          truncated: dto.truncated,
+        };
+      });
+    },
+
+    cancelSearch(sessionId: string): Promise<void> {
+      return bridgeCall("logs.cancelSearch", () =>
+        invokeCommand("cancel_managed_log_search", {
+          input: { sessionId },
+        }),
+      );
+    },
+
+    findLineAtTime(input: NativeLogFindAtTimeInput): Promise<NativeLogFindAtTimeResult> {
+      return bridgeCall("logs.findLineAtTime", async () => {
+        const dto = await invokeCommand<{
+          lineNumber: number | null;
+          found: boolean;
+        }>("find_managed_log_line_at_time", {
+          input: {
+            sessionId: input.sessionId,
+            target: input.target,
+          },
+        });
+        return { lineNumber: dto.lineNumber, found: dto.found };
       });
     },
   };

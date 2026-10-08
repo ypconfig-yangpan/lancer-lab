@@ -1,6 +1,6 @@
 import { listen } from "@tauri-apps/api/event";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { kubernetesApi } from "@/capabilities/kubernetes/api";
 import { useKubernetesWorkspaceStore } from "@/capabilities/kubernetes/connect/kubernetes-workspace-store";
@@ -13,6 +13,7 @@ import { LogViewer } from "@/capabilities/kubernetes/logs/log-viewer";
 import { resolveLogTarget } from "@/capabilities/kubernetes/logs/resolve-log-target";
 import { useK8sUiStore } from "@/capabilities/kubernetes/mock/k8s-ui-store";
 import { CompactSelect } from "@/components/ui/compact-select";
+import type { LogLine } from "@/entities/log/types";
 import { cn } from "@/shared/lib/utils";
 
 const WINDOW_LIMIT = 10_000;
@@ -114,11 +115,27 @@ export function KubernetesLogsPane({
 
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [openError, setOpenError] = useState<string | null>(null);
+  const [previous, setPrevious] = useState(false);
+  /** 0 = all (no since); else seconds */
+  const [sinceSeconds, setSinceSeconds] = useState(0);
+  const [tailLines, setTailLines] = useState(5_000);
+  /** 1-based line center for Search seek; null = follow tail / windowStart. */
+  const [seekLine, setSeekLine] = useState<number | null>(null);
+  /** 0-based fixed window start when browsing history; null = pin to live tail. */
+  const [windowStart, setWindowStart] = useState<number | null>(null);
+  const [reconnectKey, setReconnectKey] = useState(0);
+  const [streamStatus, setStreamStatus] = useState<string | null>(null);
+  /** Keep last window while reconnecting (do not flash empty). */
+  const [staleLines, setStaleLines] = useState<LogLine[]>([]);
+  const [staleTotal, setStaleTotal] = useState(0);
 
   useEffect(() => {
     if (clusterId === null || activePod === null) {
       setSessionId(null);
       setOpenError(null);
+      setStreamStatus(null);
+      setStaleLines([]);
+      setStaleTotal(0);
       return;
     }
 
@@ -127,11 +144,15 @@ export function KubernetesLogsPane({
     void (async () => {
       try {
         setOpenError(null);
+        setStreamStatus("following");
         const opened = await kubernetesApi.openLogs({
           connectionId: clusterId,
           namespace: activePod.namespace,
           pod: activePod.name,
           follow: true,
+          previous,
+          ...(sinceSeconds > 0 ? { sinceSeconds } : {}),
+          ...(sinceSeconds > 0 ? {} : { tailLines }),
           ...(container ? { container } : {}),
         });
         openedId = opened.sessionId;
@@ -140,9 +161,16 @@ export function KubernetesLogsPane({
           return;
         }
         setSessionId(opened.sessionId);
+        setSeekLine(null);
+        setWindowStart(null);
+        const info = await kubernetesApi.getLogSession(opened.sessionId);
+        if (!cancelled) {
+          setStreamStatus(info.status);
+        }
       } catch (err: unknown) {
         if (!cancelled) {
           setSessionId(null);
+          setStreamStatus("error");
           setOpenError(err instanceof Error ? err.message : String(err));
         }
       }
@@ -154,7 +182,16 @@ export function KubernetesLogsPane({
         void kubernetesApi.closeLogs(openedId);
       }
     };
-  }, [clusterId, activePod?.namespace, activePod?.name, container]);
+  }, [
+    clusterId,
+    activePod?.namespace,
+    activePod?.name,
+    container,
+    previous,
+    sinceSeconds,
+    tailLines,
+    reconnectKey,
+  ]);
 
   useEffect(() => {
     if (sessionId === null) {
@@ -165,6 +202,7 @@ export function KubernetesLogsPane({
       if (event.payload.sessionId !== sessionId) {
         return;
       }
+      setStreamStatus(event.payload.status);
       void queryClient.invalidateQueries({
         queryKey: ["kubernetes", "logs", "window", sessionId],
       });
@@ -176,19 +214,102 @@ export function KubernetesLogsPane({
     };
   }, [sessionId, queryClient]);
 
+  /** Wider context so Search / Jump land with readable surroundings. */
+  const CONTEXT_BEFORE = 400;
+  const CONTEXT_AFTER = 400;
+
   const windowQuery = useQuery({
-    queryKey: ["kubernetes", "logs", "window", sessionId],
+    queryKey: ["kubernetes", "logs", "window", sessionId, seekLine, windowStart],
     enabled: sessionId !== null,
     queryFn: async () => {
       if (sessionId === null) {
         throw new Error("no log session");
       }
       const session = await kubernetesApi.getLogSession(sessionId);
+      if (seekLine !== null && seekLine > 0) {
+        const offset = Math.max(0, seekLine - 1 - CONTEXT_BEFORE);
+        const limit = Math.min(WINDOW_LIMIT, CONTEXT_BEFORE + CONTEXT_AFTER + 1);
+        return kubernetesApi.readLogWindow({ sessionId, offset, limit });
+      }
+      if (windowStart !== null) {
+        const offset = Math.max(0, Math.min(windowStart, Math.max(0, session.totalLines - 1)));
+        return kubernetesApi.readLogWindow({
+          sessionId,
+          offset,
+          limit: WINDOW_LIMIT,
+        });
+      }
       const offset = Math.max(0, session.totalLines - WINDOW_LIMIT);
       return kubernetesApi.readLogWindow({ sessionId, offset, limit: WINDOW_LIMIT });
     },
-    refetchInterval: sessionId !== null ? 1_500 : false,
+    // Only auto-poll when pinned to live tail (not seek / not history window).
+    refetchInterval:
+      sessionId !== null && seekLine === null && windowStart === null ? 1_500 : false,
   });
+
+  const seekToLine = (lineNumber: number) => {
+    if (lineNumber <= 0) {
+      setSeekLine(null);
+      setWindowStart(null);
+      void queryClient.invalidateQueries({
+        queryKey: ["kubernetes", "logs", "window", sessionId],
+      });
+      return;
+    }
+    setWindowStart(null);
+    setSeekLine(lineNumber);
+  };
+
+  const loadOlder = useCallback(() => {
+    const offset = windowQuery.data?.offset ?? 0;
+    if (offset <= 0) return;
+    const nextStart = Math.max(0, offset - Math.floor(WINDOW_LIMIT * 0.8));
+    setSeekLine(null);
+    setWindowStart(nextStart);
+  }, [windowQuery.data?.offset]);
+
+  const pinLiveTail = useCallback(() => {
+    setSeekLine(null);
+    setWindowStart(null);
+    void queryClient.invalidateQueries({
+      queryKey: ["kubernetes", "logs", "window", sessionId],
+    });
+  }, [queryClient, sessionId]);
+
+  const jumpToTime = useCallback(
+    async (target: string): Promise<number | null> => {
+      if (sessionId === null) return null;
+      const result = await kubernetesApi.findLogLineAtTime({ sessionId, target });
+      return result.found ? result.lineNumber : null;
+    },
+    [sessionId],
+  );
+
+  const reconnect = useCallback(() => {
+    const current = windowQuery.data;
+    if (current?.lines.length) {
+      setStaleLines(current.lines);
+      setStaleTotal(current.totalLines);
+    }
+    setSeekLine(null);
+    setWindowStart(null);
+    setStreamStatus("following");
+    setReconnectKey((k) => k + 1);
+  }, [windowQuery.data]);
+
+  const sourceLabel = activePod
+    ? `${activePod.namespace}/${activePod.name}/${container || activePod.containers[0] || "app"}${previous ? " · previous" : ""}`
+    : undefined;
+
+  const displayLines = windowQuery.data?.lines ?? staleLines;
+  const displayTotal = windowQuery.data?.totalLines ?? staleTotal;
+
+  useEffect(() => {
+    if (windowQuery.data?.lines.length) {
+      setStaleLines(windowQuery.data.lines);
+      setStaleTotal(windowQuery.data.totalLines);
+    }
+  }, [windowQuery.data]);
 
   const emptyClass = cn(
     "flex h-full min-h-0 items-center justify-center p-3 text-[12px]",
@@ -212,7 +333,7 @@ export function KubernetesLogsPane({
       ? (activePod?.name ?? resolved.resourceName ?? null)
       : null;
 
-  const picker = (showWorkloadPicker || showPodPicker || showContainerPicker || lockedLabel) && (
+  const picker = (
     <div className="flex min-w-0 flex-wrap items-center gap-1.5">
       {showWorkloadPicker ? (
         <CompactSelect
@@ -264,6 +385,40 @@ export function KubernetesLogsPane({
           {lockedLabel}
         </span>
       ) : null}
+      <CompactSelect
+        value={previous ? "previous" : "current"}
+        onChange={(e) => setPrevious(e.target.value === "previous")}
+        title="Lifecycle"
+        triggerClassName="w-[96px]"
+      >
+        <option value="current">Current</option>
+        <option value="previous">Previous</option>
+      </CompactSelect>
+      <CompactSelect
+        value={String(sinceSeconds)}
+        onChange={(e) => setSinceSeconds(Number(e.target.value))}
+        title="打开时从集群拉取的时间范围（换源会重开 session）"
+        triggerClassName="w-[100px]"
+      >
+        <option value="0">Since: 不限</option>
+        <option value="300">近 5m</option>
+        <option value="1800">近 30m</option>
+        <option value="3600">近 1h</option>
+        <option value="21600">近 6h</option>
+      </CompactSelect>
+      {sinceSeconds === 0 ? (
+        <CompactSelect
+          value={String(tailLines)}
+          onChange={(e) => setTailLines(Number(e.target.value))}
+          title="打开时从集群拉取的历史行数（不是视口限制）"
+          triggerClassName="w-[110px]"
+        >
+          <option value="100">拉取 Tail 100</option>
+          <option value="1000">拉取 Tail 1k</option>
+          <option value="5000">拉取 Tail 5k</option>
+          <option value="0">拉取全部历史</option>
+        </CompactSelect>
+      ) : null}
     </div>
   );
 
@@ -279,14 +434,35 @@ export function KubernetesLogsPane({
     return <div className={emptyClass}>{t("workspace.loading")}</div>;
   }
 
-  const statusHint = windowQuery.data
-    ? `集群实时 · 本地已缓存 ${windowQuery.data.totalLines} 行`
-    : "集群实时 · 落本地缓存";
+  const windowOffset = windowQuery.data?.offset ?? 0;
+  const pinnedToTail = seekLine === null && windowStart === null;
+  const statusHint =
+    streamStatus === "error"
+      ? `断流 · 磁盘 ${displayTotal} 行（清空不删盘）`
+      : displayTotal > 0
+        ? pinnedToTail
+          ? `实时 · 磁盘 ${displayTotal} 行 · 读窗末 ${displayLines.length}`
+          : `浏览历史 · 磁盘 ${displayTotal} 行 · 偏移 ${windowOffset}`
+        : "实时 · 落本地磁盘";
+
+  const viewerExtras = {
+    sessionId,
+    onSeekToLine: seekToLine,
+    streamStatus,
+    onReconnect: reconnect,
+    totalLines: displayTotal,
+    onJumpToTime: jumpToTime,
+    canLoadOlder: windowOffset > 0,
+    onLoadOlder: loadOlder,
+    onPinLiveTail: pinLiveTail,
+    historyBrowsing: !pinnedToTail,
+    ...(sourceLabel ? { sourceLabel } : {}),
+  };
 
   // Empty / error / loading still show header chrome when embedded so user can switch service
   if (
     embedded &&
-    (openError || windowQuery.isError || !windowQuery.data || resolved.pods.length === 0)
+    resolved.pods.length === 0
   ) {
     return (
       <LogViewer
@@ -298,23 +474,45 @@ export function KubernetesLogsPane({
         enableCollapse={enableCollapse}
         density={density}
         statusHint={statusHint}
+        {...viewerExtras}
+        {...(expandedClassName ? { expandedClassName } : {})}
+      />
+    );
+  }
+
+  if (
+    embedded &&
+    openError &&
+    displayLines.length === 0
+  ) {
+    return (
+      <LogViewer
+        variant="terminal"
+        lines={[]}
+        toolbarStart={picker || undefined}
+        defaultCollapsed={defaultCollapsed}
+        enableFullscreen={enableFullscreen}
+        enableCollapse={enableCollapse}
+        density={density}
+        statusHint={openError}
+        {...viewerExtras}
         {...(expandedClassName ? { expandedClassName } : {})}
       />
     );
   }
 
   if (!embedded) {
-    if (openError) {
+    if (openError && displayLines.length === 0) {
       return <div className={cn(emptyClass, "text-destructive")}>{openError}</div>;
     }
-    if (windowQuery.isError) {
+    if (windowQuery.isError && displayLines.length === 0) {
       return (
         <div className={cn(emptyClass, "text-destructive")}>
           {windowQuery.error instanceof Error ? windowQuery.error.message : "log window failed"}
         </div>
       );
     }
-    if (!windowQuery.data) {
+    if (!windowQuery.data && displayLines.length === 0) {
       return (
         <div className={emptyClass}>
           {t("explorer.openingLogs")}
@@ -336,13 +534,14 @@ export function KubernetesLogsPane({
     return (
       <LogViewer
         variant="terminal"
-        lines={windowQuery.data?.lines ?? []}
+        lines={displayLines}
         toolbarStart={picker || undefined}
         defaultCollapsed={defaultCollapsed}
         enableFullscreen={enableFullscreen}
         enableCollapse={enableCollapse}
         density={density}
         statusHint={statusHint}
+        {...viewerExtras}
         {...(expandedClassName ? { expandedClassName } : {})}
         {...(sessionId !== null
           ? {
@@ -362,7 +561,8 @@ export function KubernetesLogsPane({
       ) : null}
       <div className="min-h-0 flex-1">
         <LogViewer
-          lines={windowQuery.data!.lines}
+          lines={displayLines}
+          {...viewerExtras}
           {...(sessionId !== null
             ? {
                 onPausedChange: (paused: boolean) => {

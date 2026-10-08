@@ -22,7 +22,8 @@ use crate::infrastructure::jenkins::{
     JenkinsJobSummaryDto, JenkinsQueueItemDto, JenkinsStatusDto, JenkinsWebhookListenManager,
 };
 use crate::infrastructure::managed_logs::{
-    start_kube_follow, LogSessionInfoDto, LogWindowDto, ManagedLogStore, OpenManagedLogInput,
+    start_kube_follow, FindLineAtTimeDto, LogSessionInfoDto, LogWindowDto, ManagedLogStore,
+    OpenManagedLogInput, SearchResultDto,
 };
 
 /// Shared application services injected into Tauri state.
@@ -342,6 +343,9 @@ impl AppServices {
             })?;
         let container = input.container.clone().unwrap_or_default();
         let follow = input.follow;
+        let previous = input.previous;
+        let since_seconds = input.since_seconds;
+        let tail_lines = input.tail_lines;
 
         let (info, path, line_counter, paused) =
             self.managed_logs.open_for_stream(input).await?;
@@ -356,6 +360,9 @@ impl AppServices {
             pod,
             container,
             follow,
+            previous,
+            since_seconds,
+            tail_lines,
             line_counter,
             paused,
         );
@@ -393,6 +400,41 @@ impl AppServices {
 
     pub async fn close_managed_log_session(&self, session_id: String) -> Result<(), AppError> {
         self.managed_logs.close(&session_id).await
+    }
+
+    pub async fn search_managed_log(
+        &self,
+        session_id: String,
+        pattern: String,
+        regex: bool,
+        case_sensitive: bool,
+        max_matches: u64,
+        cursor_byte: u64,
+    ) -> Result<SearchResultDto, AppError> {
+        self.managed_logs
+            .search(
+                &session_id,
+                pattern,
+                regex,
+                case_sensitive,
+                max_matches,
+                cursor_byte,
+            )
+            .await
+    }
+
+    pub async fn cancel_managed_log_search(&self, session_id: String) -> Result<(), AppError> {
+        self.managed_logs.cancel_search(&session_id).await
+    }
+
+    pub async fn find_managed_log_line_at_time(
+        &self,
+        session_id: String,
+        target: String,
+    ) -> Result<FindLineAtTimeDto, AppError> {
+        self.managed_logs
+            .find_line_at_time(&session_id, target)
+            .await
     }
 
     pub async fn docker_ping(&self) -> Result<DockerPingDto, AppError> {

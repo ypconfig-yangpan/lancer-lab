@@ -35,10 +35,13 @@ Tauri 2、React、Rust、Design System、typed IPC、Mock/Virtual Log Viewer、�
 
 ---
 
-## Phase 2 — Logs（核心已通）
+## Phase 2 — Logs（核心已通；加深中）
 
-Live follow / 有界窗口 / Disk-as-Source。LogSession。与 Desktop `app.log` 诊断日志分开。其余（Search / Regex / Multi Pod…）按需加深。
+Live follow / 有界窗口 / Disk-as-Source。与 Desktop `app.log` 诊断日志分开。
 
+**设计契约（2026-10）：** [docs/logs/](./logs/README.md) + 扩写 [ADR 0005](./adr/0005-large-log-architecture.md)。  
+原则：对人 Runtime、对 AI 采文本；统一体验不统一语义；不做 Universal Log Model。  
+下一刀实现序：稀疏索引 → 历史/实时 Cursor → 全盘搜(行号) → Workbench UI（previous/since/时间跳转）。
 ---
 
 ## Phase 3 — Operations（进行中）

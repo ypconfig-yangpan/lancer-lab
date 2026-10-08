@@ -29,6 +29,13 @@ pub fn run() {
             );
             Ok(())
         })
+        .on_window_event(|window, event| {
+            // 关窗 = 隐藏；真正退出走菜单「退出 Lancer」→ app_request_exit
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             crate::commands::health::app_health,
             crate::commands::health::ack_abnormal_exit,
@@ -63,6 +70,9 @@ pub fn run() {
             crate::commands::managed_log::read_managed_log_window,
             crate::commands::managed_log::close_managed_log_session,
             crate::commands::managed_log::pause_managed_log_session,
+            crate::commands::managed_log::search_managed_log,
+            crate::commands::managed_log::cancel_managed_log_search,
+            crate::commands::managed_log::find_managed_log_line_at_time,
             crate::commands::docker::docker_ping,
             crate::commands::docker::docker_list_containers,
             crate::commands::docker::docker_container_logs,

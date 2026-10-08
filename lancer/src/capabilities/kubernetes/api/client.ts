@@ -17,6 +17,12 @@ import type { ResourceWatchKind } from "@/entities/watch/types";
 import type { ManifestResourceKind, ResourceYaml } from "@/entities/yaml/types";
 import { createDefaultKubernetesNativeApi } from "@/native/kubernetes";
 import { createDefaultLogsNativeApi } from "@/native/logs";
+import type {
+  NativeLogFindAtTimeInput,
+  NativeLogFindAtTimeResult,
+  NativeLogSearchInput,
+  NativeLogSearchResult,
+} from "@/native/types";
 import { kubernetesPodExecApi } from "./exec";
 
 const k8s = createDefaultKubernetesNativeApi();
@@ -95,6 +101,9 @@ export const kubernetesApi = {
     pod?: string;
     container?: string;
     follow?: boolean;
+    previous?: boolean;
+    sinceSeconds?: number;
+    tailLines?: number;
   }): Promise<{ sessionId: string }> {
     return logs.open({
       provider: "kubernetes",
@@ -123,6 +132,27 @@ export const kubernetesApi = {
 
   getLogSession(sessionId: string): Promise<LogSessionInfo> {
     return logs.getSession(sessionId);
+  },
+
+  searchLogs(input: NativeLogSearchInput): Promise<NativeLogSearchResult> {
+    if (!logs.search) {
+      return Promise.reject(new Error("logs.search unavailable"));
+    }
+    return logs.search(input);
+  },
+
+  cancelLogSearch(sessionId: string): Promise<void> {
+    if (!logs.cancelSearch) {
+      return Promise.resolve();
+    }
+    return logs.cancelSearch(sessionId);
+  },
+
+  findLogLineAtTime(input: NativeLogFindAtTimeInput): Promise<NativeLogFindAtTimeResult> {
+    if (!logs.findLineAtTime) {
+      return Promise.reject(new Error("logs.findLineAtTime unavailable"));
+    }
+    return logs.findLineAtTime(input);
   },
 
   scaleDeployment(input: {

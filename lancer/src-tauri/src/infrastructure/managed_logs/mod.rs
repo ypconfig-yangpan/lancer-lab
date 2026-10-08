@@ -4,11 +4,14 @@
 //! Phase 2.2a: seed JSONL on open.
 //! Phase 2.2b: when `connection_id` is set and `seed_lines` is None → kube follow → append.
 
+mod index;
+mod search;
 mod stream;
+mod time_jump;
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -21,11 +24,27 @@ use tokio::task;
 
 use crate::domain::error::AppError;
 
+use self::index::{index_path_for_log, rebuild_index_from_log, run_retention, SparseLineIndex};
+use self::search::{search_log_file, SearchQuery};
+use self::time_jump::find_line_at_time;
+
+#[allow(unused_imports)] // re-exported for IPC/event consumers
+pub use search::{SearchMatchDto, SearchResultDto};
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FindLineAtTimeDto {
+    pub line_number: Option<u64>,
+    pub found: bool,
+}
 #[allow(unused_imports)] // re-exported for IPC/event consumers
 pub use stream::{ManagedLogAppendedPayload, MANAGED_LOG_APPENDED_EVENT};
 
 const DEFAULT_SEED_LINES: usize = 20_000;
 const MAX_WINDOW_LIMIT: usize = 10_000;
+/// Retention: keep ~14 days and ≤ 2 GiB under managed-logs/.
+const RETENTION_MAX_AGE_DAYS: u64 = 14;
+const RETENTION_MAX_TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -71,6 +90,12 @@ pub struct OpenManagedLogInput {
     pub container: Option<String>,
     pub follow: bool,
     pub seed_lines: Option<usize>,
+    /// Previous container instance (kube `previous`).
+    pub previous: bool,
+    /// Only logs newer than now - since_seconds (kube `since_seconds`).
+    pub since_seconds: Option<i64>,
+    /// History depth when opening follow (kube `tail_lines`). Default 5000.
+    pub tail_lines: Option<i64>,
 }
 
 pub(crate) struct SessionState {
@@ -86,6 +111,8 @@ pub(crate) struct SessionState {
 pub struct ManagedLogStore {
     root: Arc<Mutex<Option<PathBuf>>>,
     sessions: Arc<Mutex<HashMap<String, SessionState>>>,
+    /// Per-session cancel flag for in-flight search (new search cancels previous).
+    search_cancels: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
 }
 
 impl ManagedLogStore {
@@ -93,11 +120,36 @@ impl ManagedLogStore {
         Self {
             root: Arc::new(Mutex::new(None)),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            search_cancels: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     pub async fn set_root(&self, root: PathBuf) -> Result<(), AppError> {
         fs::create_dir_all(&root).map_err(|e| map_io_error("create managed-logs dir", e))?;
+        let root_for_retention = root.clone();
+        let deleted = task::spawn_blocking(move || {
+            run_retention(
+                &root_for_retention,
+                RETENTION_MAX_AGE_DAYS,
+                RETENTION_MAX_TOTAL_BYTES,
+            )
+        })
+        .await
+        .map_err(|e| {
+            AppError::coded(
+                "LOG_STREAM_FAILED",
+                "failed to join retention task",
+                Some(e.to_string()),
+                false,
+            )
+        })??;
+        if deleted > 0 {
+            tracing::info!(
+                target: "lancer::logs",
+                deleted,
+                "managed-logs retention cleaned old files"
+            );
+        }
         let mut guard = self.root.lock().await;
         *guard = Some(root);
         Ok(())
@@ -264,16 +316,17 @@ impl ManagedLogStore {
         let limit = (limit as usize).clamp(1, MAX_WINDOW_LIMIT);
         let offset = offset as usize;
         let path_for_read = path.clone();
-        let lines = task::spawn_blocking(move || read_window_from_file(&path_for_read, offset, limit))
-            .await
-            .map_err(|e| {
-                AppError::coded(
-                    "LOG_STREAM_FAILED",
-                    "failed to join window read task",
-                    Some(e.to_string()),
-                    true,
-                )
-            })??;
+        let lines =
+            task::spawn_blocking(move || read_window_from_file_indexed(&path_for_read, offset, limit))
+                .await
+                .map_err(|e| {
+                    AppError::coded(
+                        "LOG_STREAM_FAILED",
+                        "failed to join window read task",
+                        Some(e.to_string()),
+                        true,
+                    )
+                })??;
 
         Ok(LogWindowDto {
             session_id: session_id.to_string(),
@@ -284,7 +337,114 @@ impl ManagedLogStore {
         })
     }
 
+    /// Full-file search via ripgrep crates. Returns locate-only matches (line/offset).
+    pub async fn search(
+        &self,
+        session_id: &str,
+        pattern: String,
+        regex: bool,
+        case_sensitive: bool,
+        max_matches: u64,
+        cursor_byte: u64,
+    ) -> Result<SearchResultDto, AppError> {
+        let path = {
+            let sessions = self.sessions.lock().await;
+            let session = sessions
+                .get(session_id)
+                .ok_or_else(|| session_not_found(session_id))?;
+            session.path.clone()
+        };
+
+        let cancelled = {
+            let mut cancels = self.search_cancels.lock().await;
+            if let Some(prev) = cancels.get(session_id) {
+                prev.store(true, Ordering::SeqCst);
+            }
+            let flag = Arc::new(AtomicBool::new(false));
+            cancels.insert(session_id.to_string(), flag.clone());
+            flag
+        };
+
+        let query = SearchQuery {
+            pattern,
+            regex,
+            case_sensitive,
+            max_matches: max_matches as usize,
+            cursor_byte,
+        };
+        let path_for_search = path.clone();
+        let cancelled_for_search = cancelled.clone();
+        let result = task::spawn_blocking(move || {
+            search_log_file(&path_for_search, &query, cancelled_for_search)
+        })
+        .await
+        .map_err(|e| {
+            AppError::coded(
+                "LOG_STREAM_FAILED",
+                "failed to join search task",
+                Some(e.to_string()),
+                true,
+            )
+        })??;
+
+        // Drop cancel token if still ours and search finished.
+        {
+            let mut cancels = self.search_cancels.lock().await;
+            if let Some(current) = cancels.get(session_id) {
+                if Arc::ptr_eq(current, &cancelled) {
+                    cancels.remove(session_id);
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
+    pub async fn cancel_search(&self, session_id: &str) -> Result<(), AppError> {
+        let cancels = self.search_cancels.lock().await;
+        if let Some(flag) = cancels.get(session_id) {
+            flag.store(true, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+
+    /// First line with timestamp ≥ / matching `target` (ISO or HH:mm[:ss]).
+    pub async fn find_line_at_time(
+        &self,
+        session_id: &str,
+        target: String,
+    ) -> Result<FindLineAtTimeDto, AppError> {
+        let path = {
+            let sessions = self.sessions.lock().await;
+            let session = sessions
+                .get(session_id)
+                .ok_or_else(|| session_not_found(session_id))?;
+            session.path.clone()
+        };
+        let path_for = path.clone();
+        let line = task::spawn_blocking(move || find_line_at_time(&path_for, &target))
+            .await
+            .map_err(|e| {
+                AppError::coded(
+                    "LOG_STREAM_FAILED",
+                    "failed to join time jump task",
+                    Some(e.to_string()),
+                    true,
+                )
+            })??;
+        Ok(FindLineAtTimeDto {
+            found: line.is_some(),
+            line_number: line,
+        })
+    }
+
     pub async fn close(&self, session_id: &str) -> Result<(), AppError> {
+        {
+            let mut cancels = self.search_cancels.lock().await;
+            if let Some(flag) = cancels.remove(session_id) {
+                flag.store(true, Ordering::SeqCst);
+            }
+        }
         let mut sessions = self.sessions.lock().await;
         let Some(mut session) = sessions.remove(session_id) else {
             return Err(session_not_found(session_id));
@@ -298,12 +458,19 @@ impl ManagedLogStore {
     }
 
     pub async fn clear_all(&self) {
+        {
+            let cancels = self.search_cancels.lock().await;
+            for flag in cancels.values() {
+                flag.store(true, Ordering::SeqCst);
+            }
+        }
         let mut sessions = self.sessions.lock().await;
         for (_, mut session) in sessions.drain() {
             if let Some(abort) = session.abort.take() {
                 abort.abort();
             }
         }
+        self.search_cancels.lock().await.clear();
     }
 
     async fn prepare_session_file(
@@ -401,6 +568,9 @@ pub fn start_kube_follow(
     pod: String,
     container: String,
     follow: bool,
+    previous: bool,
+    since_seconds: Option<i64>,
+    tail_lines: Option<i64>,
     line_counter: Arc<AtomicU64>,
     paused: Arc<AtomicBool>,
 ) -> tokio::task::AbortHandle {
@@ -414,18 +584,29 @@ pub fn start_kube_follow(
         pod,
         container,
         follow,
+        previous,
+        since_seconds,
+        tail_lines,
         line_counter,
         paused,
     )
 }
 
 pub(crate) fn append_jsonl_lines(path: &Path, lines: &[LogLineDto]) -> Result<usize, AppError> {
+    if lines.is_empty() {
+        return Ok(0);
+    }
+    let idx_path = index_path_for_log(path);
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
         .map_err(|e| map_io_error("append managed log file", e))?;
     for line in lines {
+        let byte_offset = file
+            .stream_position()
+            .map_err(|e| map_io_error("stream_position append", e))?;
+        SparseLineIndex::append_anchor_file(&idx_path, line.line_number, byte_offset)?;
         let json = serde_json::to_string(line).map_err(|e| {
             AppError::coded(
                 "LOG_STREAM_FAILED",
@@ -540,11 +721,17 @@ fn write_seed_file(
         .open(path)
         .map_err(|e| map_io_error("open managed log file", e))?;
 
+    let mut index = SparseLineIndex::default();
     for i in 0..count {
+        let byte_offset = file
+            .stream_position()
+            .map_err(|e| map_io_error("stream_position seed", e))?;
+        let line_number = (i + 1) as u64;
+        index.record_if_needed(line_number, byte_offset);
         let level = mock_level(i);
         let line = LogLineDto {
             id: format!("log-{i}"),
-            line_number: (i + 1) as u64,
+            line_number,
             timestamp: mock_timestamp(i),
             level: level.to_string(),
             pod: pod.to_string(),
@@ -563,10 +750,13 @@ fn write_seed_file(
     }
     file.flush()
         .map_err(|e| map_io_error("flush managed log file", e))?;
+    index.save(&index_path_for_log(path))?;
     Ok(count)
 }
 
-fn read_window_from_file(
+/// Read window using sparse index seek (docs/logs/storage-and-index.md).
+/// `offset` is 0-based line index into the file (line_number = offset + 1).
+fn read_window_from_file_indexed(
     path: &Path,
     offset: usize,
     limit: usize,
@@ -583,30 +773,67 @@ fn read_window_from_file(
             map_io_error("open managed log for read", e)
         }
     })?;
-    let reader = BufReader::new(file);
-    let mut lines = Vec::with_capacity(limit);
-    for (idx, result) in reader.lines().enumerate() {
-        if idx < offset {
-            continue;
+
+    let target_line = (offset as u64).saturating_add(1);
+    let idx_path = index_path_for_log(path);
+    let index = if idx_path.exists() {
+        SparseLineIndex::load(&idx_path)?
+    } else {
+        rebuild_index_from_log(path)?
+    };
+
+    let mut reader = BufReader::new(file);
+    let mut current_line = 1u64;
+    if let Some((anchor_line, byte_off)) = index.seek_hint(target_line) {
+        reader
+            .seek(SeekFrom::Start(byte_off))
+            .map_err(|e| map_io_error("seek managed log", e))?;
+        current_line = anchor_line;
+    }
+
+    // Skip from anchor to target.
+    while current_line < target_line {
+        let mut skip = String::new();
+        let n = reader
+            .read_line(&mut skip)
+            .map_err(|e| map_io_error("skip to window", e))?;
+        if n == 0 {
+            return Ok(Vec::new());
         }
-        if lines.len() >= limit {
+        current_line += 1;
+    }
+
+    let mut lines = Vec::with_capacity(limit);
+    while lines.len() < limit {
+        let mut raw = String::new();
+        let n = reader
+            .read_line(&mut raw)
+            .map_err(|e| map_io_error("read managed log line", e))?;
+        if n == 0 {
             break;
         }
-        let raw = result.map_err(|e| map_io_error("read managed log line", e))?;
+        if raw.ends_with('\n') {
+            raw.pop();
+            if raw.ends_with('\r') {
+                raw.pop();
+            }
+        }
+        let idx = current_line.saturating_sub(1) as usize;
         match serde_json::from_str::<LogLineDto>(&raw) {
             Ok(line) => lines.push(line),
             Err(_) => {
                 lines.push(LogLineDto {
                     id: format!("raw-{idx}"),
-                    line_number: (idx + 1) as u64,
+                    line_number: current_line,
                     timestamp: String::new(),
-                    level: "UNKNOWN".to_string(),
+                    level: String::new(),
                     pod: String::new(),
                     container: String::new(),
                     message: raw,
                 });
             }
         }
+        current_line += 1;
     }
     Ok(lines)
 }
@@ -636,6 +863,9 @@ mod tests {
                 container: Some("app".into()),
                 follow: true,
                 seed_lines: Some(100),
+                previous: false,
+                since_seconds: None,
+                tail_lines: None,
             })
             .await
             .unwrap();
@@ -668,5 +898,49 @@ mod tests {
     #[test]
     fn sanitize_replaces_path_separators() {
         assert_eq!(sanitize_segment("a/b:c"), "a_b_c");
+    }
+
+    #[tokio::test]
+    async fn indexed_tail_window_matches_line_numbers() {
+        let root = std::env::temp_dir().join(format!(
+            "lancer-managed-logs-idx-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        let store = ManagedLogStore::new();
+        store.set_root(root.clone()).await.unwrap();
+
+        let info = store
+            .open(OpenManagedLogInput {
+                provider: "kubernetes".into(),
+                connection_id: Some("ctx-b".into()),
+                namespace: Some("default".into()),
+                pod: Some("svc-2".into()),
+                container: Some("app".into()),
+                follow: false,
+                seed_lines: Some(5_500),
+                previous: false,
+                since_seconds: None,
+                tail_lines: None,
+            })
+            .await
+            .unwrap();
+
+        assert!(Path::new(&info.file_path).exists());
+        let idx = index_path_for_log(Path::new(&info.file_path));
+        assert!(idx.exists(), "sparse .idx should be written with seed");
+
+        let window = store
+            .read_window(&info.session_id, 5_000, 100)
+            .await
+            .unwrap();
+        assert_eq!(window.lines.len(), 100);
+        assert_eq!(window.lines[0].line_number, 5_001);
+        assert_eq!(window.lines[99].line_number, 5_100);
+
+        store.close(&info.session_id).await.unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 }

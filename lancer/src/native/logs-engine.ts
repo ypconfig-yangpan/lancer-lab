@@ -1,6 +1,10 @@
 import type { LogLine, LogSessionInfo, LogWindow } from "@/entities/log/types";
 import type {
+  NativeLogFindAtTimeInput,
+  NativeLogFindAtTimeResult,
   NativeLogOpenInput,
+  NativeLogSearchInput,
+  NativeLogSearchResult,
   NativeLogSession,
   NativeLogsApi,
   NativeLogWindowInput,
@@ -103,6 +107,80 @@ export function createInMemoryLogsNativeApi(options?: {
         );
       }
       return { ...session.info, totalLines: session.lines.length };
+    },
+
+    async search(input: NativeLogSearchInput): Promise<NativeLogSearchResult> {
+      const session = sessions.get(input.sessionId);
+      if (!session) {
+        throw new NativeCapabilityError(
+          "LOG_FILE_NOT_FOUND",
+          `log session not found: ${input.sessionId}`,
+        );
+      }
+      const max = Math.min(Math.max(input.maxMatches ?? 200, 1), 5_000);
+      const cursor = input.cursorByte ?? 0;
+      const pattern = input.pattern;
+      if (!pattern) {
+        return { matches: [], nextCursorByte: null, hasMore: false, truncated: false };
+      }
+      let re: RegExp;
+      try {
+        const body = input.regex ? pattern : pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        re = new RegExp(body, input.caseSensitive ? "" : "i");
+      } catch {
+        throw new NativeCapabilityError("LOG_STREAM_FAILED", "invalid search pattern");
+      }
+      const matches: NativeLogSearchResult["matches"] = [];
+      let lastByte = cursor;
+      for (let i = 0; i < session.lines.length; i += 1) {
+        const line = session.lines[i]!;
+        // Approximate byte cursor: line index (engine has no real offsets).
+        const approxByte = i;
+        if (approxByte < cursor) continue;
+        // Match message + level only (same contract as Rust Disk search).
+        const haystack = `${line.level} ${line.message}`;
+        if (!re.test(haystack)) continue;
+        matches.push({ lineNumber: line.lineNumber, byteOffset: approxByte });
+        lastByte = approxByte;
+        if (matches.length >= max) {
+          return {
+            matches,
+            nextCursorByte: lastByte + 1,
+            hasMore: true,
+            truncated: true,
+          };
+        }
+      }
+      return { matches, nextCursorByte: null, hasMore: false, truncated: false };
+    },
+
+    async cancelSearch(_sessionId: string): Promise<void> {
+      // In-memory search is sync; nothing to cancel.
+    },
+
+    async findLineAtTime(input: NativeLogFindAtTimeInput): Promise<NativeLogFindAtTimeResult> {
+      const session = sessions.get(input.sessionId);
+      if (!session) {
+        throw new NativeCapabilityError(
+          "LOG_FILE_NOT_FOUND",
+          `log session not found: ${input.sessionId}`,
+        );
+      }
+      const target = input.target.trim();
+      if (!target) {
+        return { lineNumber: null, found: false };
+      }
+      const isIso = target.includes("-") || target.includes("T");
+      for (const line of session.lines) {
+        if (!line.timestamp) continue;
+        const hit = isIso
+          ? line.timestamp >= target
+          : line.timestamp.includes(target);
+        if (hit) {
+          return { lineNumber: line.lineNumber, found: true };
+        }
+      }
+      return { lineNumber: null, found: false };
     },
   };
 }

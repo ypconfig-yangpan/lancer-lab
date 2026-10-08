@@ -54,6 +54,12 @@ export interface NativeLogOpenInput {
   pod?: string;
   container?: string;
   follow?: boolean;
+  /** Previous container instance (kube previous). */
+  previous?: boolean;
+  /** Only logs newer than now − sinceSeconds. */
+  sinceSeconds?: number;
+  /** History depth when opening follow (kube tail_lines). */
+  tailLines?: number;
 }
 
 export interface NativeLogSession {
@@ -66,6 +72,40 @@ export interface NativeLogWindowInput {
   limit: number;
 }
 
+/** Locate-only match; text comes from readWindow. */
+export interface NativeLogSearchMatch {
+  lineNumber: number;
+  byteOffset: number;
+}
+
+export interface NativeLogSearchInput {
+  sessionId: string;
+  pattern: string;
+  regex?: boolean;
+  caseSensitive?: boolean;
+  maxMatches?: number;
+  /** Opaque resume cursor (byte offset). */
+  cursorByte?: number;
+}
+
+export interface NativeLogSearchResult {
+  matches: NativeLogSearchMatch[];
+  nextCursorByte: number | null;
+  hasMore: boolean;
+  truncated: boolean;
+}
+
+export interface NativeLogFindAtTimeInput {
+  sessionId: string;
+  /** ISO timestamp or HH:mm[:ss] fragment. */
+  target: string;
+}
+
+export interface NativeLogFindAtTimeResult {
+  lineNumber: number | null;
+  found: boolean;
+}
+
 export interface NativeLogsApi {
   open(input: NativeLogOpenInput): Promise<NativeLogSession>;
   close(sessionId: string): Promise<void>;
@@ -73,6 +113,10 @@ export interface NativeLogsApi {
   getSession(sessionId: string): Promise<LogSessionInfo>;
   /** Pause/resume kube follow append (2.2b). Optional for in-memory engines. */
   setPaused?(sessionId: string, paused: boolean): Promise<LogSessionInfo>;
+  /** Full-file search (ripgrep crates). Returns line/offset only. */
+  search?(input: NativeLogSearchInput): Promise<NativeLogSearchResult>;
+  cancelSearch?(sessionId: string): Promise<void>;
+  findLineAtTime?(input: NativeLogFindAtTimeInput): Promise<NativeLogFindAtTimeResult>;
 }
 
 export interface NativeTerminalOpenInput {

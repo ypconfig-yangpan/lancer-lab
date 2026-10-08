@@ -38,6 +38,9 @@ pub fn spawn_kube_follow(
     pod: String,
     container: String,
     follow: bool,
+    previous: bool,
+    since_seconds: Option<i64>,
+    tail_lines: Option<i64>,
     line_counter: Arc<AtomicU64>,
     paused: Arc<AtomicBool>,
 ) -> tokio::task::AbortHandle {
@@ -52,6 +55,9 @@ pub fn spawn_kube_follow(
             pod,
             container,
             follow,
+            previous,
+            since_seconds,
+            tail_lines,
             line_counter,
             paused,
         )
@@ -67,11 +73,13 @@ pub fn spawn_kube_follow(
             let mut guard = sessions.lock().await;
             if let Some(session) = guard.get_mut(&session_id) {
                 session.info.status = "error".to_string();
+                let total = session.line_counter.load(Ordering::SeqCst);
+                session.info.total_lines = total;
                 let _ = app.emit(
                     MANAGED_LOG_APPENDED_EVENT,
                     ManagedLogAppendedPayload {
                         session_id: session_id.clone(),
-                        total_lines: session.info.total_lines,
+                        total_lines: total,
                         status: session.info.status.clone(),
                     },
                 );
@@ -91,20 +99,34 @@ async fn run_follow(
     pod: String,
     container: String,
     follow: bool,
+    previous: bool,
+    since_seconds: Option<i64>,
+    tail_lines: Option<i64>,
     line_counter: Arc<AtomicU64>,
     paused: Arc<AtomicBool>,
 ) -> Result<(), AppError> {
     let api: Api<Pod> = Api::namespaced(client, &namespace);
+    // since_seconds and tail_lines are mutually exclusive in practice; 0 / None = unlimited history.
+    let effective_tail = if since_seconds.is_some() {
+        None
+    } else {
+        match tail_lines {
+            None => Some(5_000),
+            Some(0) => None,
+            Some(n) => Some(n),
+        }
+    };
     let params = LogParams {
         follow,
         timestamps: true,
+        previous,
+        since_seconds,
         container: if container.is_empty() {
             None
         } else {
             Some(container.clone())
         },
-        // Tail recent history then follow — avoids empty pane on open.
-        tail_lines: Some(5_000),
+        tail_lines: effective_tail,
         ..LogParams::default()
     };
 
@@ -115,6 +137,9 @@ async fn run_follow(
         pod = %pod,
         container = %container,
         follow,
+        previous,
+        since_seconds = ?since_seconds,
+        tail_lines = ?effective_tail,
         "starting kube log stream"
     );
 
@@ -130,6 +155,9 @@ async fn run_follow(
     let mut lines = stream.lines();
     let mut pending: Vec<LogLineDto> = Vec::with_capacity(32);
     let mut since_emit = 0u32;
+    // Stream cursor for overlap dedup (docs/logs/history-live-resume.md).
+    let mut last_ts = String::new();
+    let mut last_msg = String::new();
 
     loop {
         if paused.load(Ordering::SeqCst) {
@@ -174,6 +202,19 @@ async fn run_follow(
             set_session_status(&sessions, &session_id, "open").await;
             return Ok(());
         };
+
+        let (ts, message) = split_kube_timestamp(&raw);
+        if !ts.is_empty()
+            && !last_ts.is_empty()
+            && ts <= last_ts.as_str()
+            && message == last_msg
+        {
+            continue;
+        }
+        if !ts.is_empty() {
+            last_ts = ts.to_string();
+            last_msg = message.to_string();
+        }
 
         let n = line_counter.fetch_add(1, Ordering::SeqCst) + 1;
         pending.push(parse_kube_line(n, &pod, &container, &raw));
