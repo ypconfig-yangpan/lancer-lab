@@ -12,5 +12,4 @@ pub use client::{
     JenkinsExecutorStatusDto, JenkinsJobConfigDto, JenkinsJobDetailDto, JenkinsJobSummaryDto,
     JenkinsQueueItemDto, JenkinsStatusDto,
 };
-pub use events::JENKINS_BUILD_EVENT;
 pub use webhook::{JenkinsWebhookListenConfig, JenkinsWebhookListenManager};

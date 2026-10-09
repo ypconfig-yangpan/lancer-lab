@@ -115,7 +115,8 @@ pub fn run() {
         .expect("error while building Lancer");
 
     app.run(|app_handle, event| match event {
-        // macOS：Dock 再点图标时把隐藏的主窗口唤回
+        // macOS：Dock 再点图标时把隐藏的主窗口唤回（Windows/Linux 无此变体）
+        #[cfg(target_os = "macos")]
         RunEvent::Reopen {
             has_visible_windows, ..
         } => {
